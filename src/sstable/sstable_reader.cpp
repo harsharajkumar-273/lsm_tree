@@ -147,15 +147,25 @@ std::optional<std::optional<std::string>> SSTable::get(const std::string& key) c
 
     if (index_.empty()) return std::nullopt;
 
-    int lo = 0, hi = static_cast<int>(index_.size()) - 1;
+    // size_t throughout, so a large index cannot be truncated by the cast.
+    //
+    // `static_cast<int>(index_.size()) - 1` silently produces a negative hi once
+    // the index exceeds INT_MAX — at 3e9 entries it evaluates to -1294967297, so
+    // `while (lo < hi)` never runs and every lookup returns block 0 regardless of
+    // the key. That is a silent wrong answer rather than a crash, which is the
+    // worst shape for a read path to fail in.
+    //
+    // The midpoint form is unchanged: `lo + (hi - lo + 1) / 2` cannot overflow
+    // because the difference is computed before the addition.
+    size_t lo = 0, hi = index_.size() - 1;
     while (lo < hi) {
-        int mid = lo + (hi - lo + 1) / 2;
+        size_t mid = lo + (hi - lo + 1) / 2;
         if (index_[mid].first <= key) lo = mid;
         else hi = mid - 1;
     }
 
     uint64_t block_start_offset = index_[lo].second;
-    uint64_t block_end_offset   = (static_cast<size_t>(lo + 1) < index_.size())
+    uint64_t block_end_offset   = (lo + 1 < index_.size())
                                   ? index_[lo + 1].second
                                   : index_offset_;
 
@@ -258,9 +268,10 @@ std::unique_ptr<SSTableIterator> SSTable::createIterator() const {
 
 uint64_t SSTable::findBlock(const std::string& key) const {
     if (index_.empty()) return 0;
-    int lo = 0, hi = static_cast<int>(index_.size()) - 1;
+    // Same truncation hazard as the search in get(); see the comment there.
+    size_t lo = 0, hi = index_.size() - 1;
     while (lo < hi) {
-        int mid = lo + (hi - lo + 1) / 2;
+        size_t mid = lo + (hi - lo + 1) / 2;
         if (index_[mid].first <= key) lo = mid;
         else hi = mid - 1;
     }
