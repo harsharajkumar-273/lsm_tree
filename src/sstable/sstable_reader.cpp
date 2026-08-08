@@ -49,6 +49,7 @@ SSTable::SSTable(const std::string& path) : path_(path) {
         throw std::runtime_error("SSTable: cannot open: " + path);
 
     uint64_t file_size = in.tellg();
+    file_size_ = file_size;
     if (file_size < 16)
         throw std::runtime_error("SSTable: file too small: " + path);
 
@@ -88,7 +89,7 @@ SSTable::SSTable(const std::string& path) : path_(path) {
 
     index_.resize(index_count);
     for (auto& [key, offset] : index_) {
-        key    = readString(in);
+        key    = readString(in, file_size);
         offset = readUint64(in);
     }
 
@@ -100,7 +101,7 @@ SSTable::SSTable(const std::string& path) : path_(path) {
         in.seekg(index_.back().second);
         Entry e;
         while (static_cast<uint64_t>(in.tellg()) < index_offset)
-            e = readEntry(in);
+            e = readEntry(in, file_size_);
         largest_key_ = e.key;
     }
 }
@@ -220,7 +221,7 @@ std::vector<SSTable::Entry> SSTable::readAll() const {
     uint64_t idx_off = readUint64(in);
     in.seekg(0);
     while (static_cast<uint64_t>(in.tellg()) < idx_off && in.peek() != EOF) {
-        entries.push_back(readEntry(in));
+        entries.push_back(readEntry(in, file_size_));
     }
     return entries;
 }
@@ -278,19 +279,35 @@ uint64_t SSTable::findBlock(const std::string& key) const {
     return index_[lo].second;
 }
 
-SSTable::Entry SSTable::readEntry(std::ifstream& in) {
+SSTable::Entry SSTable::readEntry(std::ifstream& in, uint64_t max_len) {
     uint8_t is_tombstone;
     in.read(reinterpret_cast<char*>(&is_tombstone), 1);
     Entry e;
-    e.key = readString(in);
-    std::string val = readString(in);
+    e.key = readString(in, max_len);
+    std::string val = readString(in, max_len);
     e.value = is_tombstone ? std::nullopt : std::optional<std::string>(val);
     return e;
 }
 
-std::string SSTable::readString(std::ifstream& in) {
+std::string SSTable::readString(std::ifstream& in, uint64_t max_len) {
     uint32_t len = 0;
     in.read(reinterpret_cast<char*>(&len), 4);
+
+    // The length prefix is bounded before it sizes an allocation.
+    //
+    // `std::string s(len, '\0')` reserved up to 4 GB from a value taken straight
+    // off disk, before a single content byte was read — a corrupted or crafted
+    // prefix produced std::bad_alloc rather than a diagnosable error.
+    //
+    // A stored string cannot exceed the size of the file holding it, so the file
+    // size is the bound. Generous rather than tight, but free to check, and it
+    // converts an out-of-memory abort into a message naming both numbers.
+    if (static_cast<uint64_t>(len) > max_len) {
+        throw std::runtime_error("SSTable: string length " + std::to_string(len) +
+                                 " exceeds file size " + std::to_string(max_len) +
+                                 "; table is corrupt");
+    }
+
     std::string s(len, '\0');
     in.read(s.data(), len);
     return s;

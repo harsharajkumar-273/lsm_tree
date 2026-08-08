@@ -46,14 +46,17 @@ private:
     std::unique_ptr<BloomFilter> bloom_;
     std::string smallest_key_;
     std::string largest_key_;
+    uint64_t file_size_ = 0;
     uint64_t index_offset_ = 0;
 
     uint64_t findBlock(const std::string& key) const;
 
     static void writeEntry(std::ofstream& out, const Entry& e);
-    static Entry readEntry(std::ifstream& in);
+    static Entry readEntry(std::ifstream& in, uint64_t max_len);
     static void writeString(std::ofstream& out, const std::string& s);
-    static std::string readString(std::ifstream& in);
+    // max_len bounds the length prefix taken from disk. A stored string cannot
+    // be longer than the file containing it, so callers pass the file size.
+    static std::string readString(std::ifstream& in, uint64_t max_len);
     static void writeUint32(std::ofstream& out, uint32_t v);
     static uint32_t readUint32(std::ifstream& in);
     static void writeUint64(std::ofstream& out, uint64_t v);
