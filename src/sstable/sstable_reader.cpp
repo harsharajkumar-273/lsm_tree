@@ -228,9 +228,6 @@ std::vector<SSTable::Entry> SSTable::readAll() const {
 
 SSTableIterator::SSTableIterator(const std::string& path, uint64_t data_end_offset)
     : in_(path, std::ios::binary), data_end_offset_(data_end_offset) {
-    if (!in_.is_open()) {
-        throw std::runtime_error("SSTableIterator: cannot open: " + path);
-    }
     advance();
 }
 

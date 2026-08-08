@@ -59,7 +59,6 @@ int main() {
     if (large_sst.indexSize() != 10) {
         fail("SSTable Large Block Sizing", "Expected each 16KB large entry to start its own block (expected 10 blocks)");
     }
-
     auto lval = large_sst.get("lkey_5");
     if (!lval || *lval != large_val) {
         fail("SSTable Large Payload", "Failed to retrieve large payload key lkey_5");

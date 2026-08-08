@@ -36,8 +36,8 @@ public:
     const std::string& largestKey()  const { return largest_key_; }
     const std::string& path()        const { return path_; }
     uint64_t indexOffset()            const { return index_offset_; }
-    size_t indexSize()                const { return index_.size(); }
-    int fd()                          const { return fd_; }
+    size_t indexSize()               const { return index_.size(); }
+    int fd()                         const { return fd_; }
 
 private:
     std::string path_;

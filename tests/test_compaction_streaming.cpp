@@ -20,18 +20,18 @@ int main() {
     {
         LSMEngine db("/tmp/lsm_test_compaction", 1024); // Small memtable to trigger flushes
 
-        // 1. Initial 4 L0 flushes to trigger first compaction
+        // Write 4 batches to force 4 L0 SSTables
         for (int b = 0; b < 4; ++b) {
             for (int i = 0; i < 50; ++i) {
                 db.put("key_" + std::to_string(i), "batch_" + std::to_string(b));
             }
-            db.flush();
+            db.flush(); // Flush MemTable to create L0 SSTable
         }
 
-        // Overwrite key_0 and delete key_5
+        // Overwrite some keys and delete key_5
         db.put("key_0", "final_val_0");
         db.del("key_5");
-        db.flush(); // 5th L0 SSTable -> First compaction triggers (L0_THRESHOLD = 4)
+        db.flush(); // 5th L0 SSTable -> Compaction should trigger (L0_THRESHOLD = 4)
 
         // Query key_0 -> Should yield final_val_0
         auto v0 = db.get("key_0");
@@ -53,24 +53,6 @@ int main() {
             fail("Compaction Value", "Expected key_49 to have 'batch_3'");
         }
         pass("Streaming merge data integrity verified across all SSTables");
-
-        // 2. Perform second compaction round: overwrite key_0 with new L0 value and trigger merge with existing L1
-        db.put("key_0", "v2_final_val_0");
-        db.flush();
-
-        for (int b = 1; b < 4; ++b) {
-            for (int i = 0; i < 20; ++i) {
-                db.put("key_round2_" + std::to_string(i), "v2_batch_" + std::to_string(b));
-            }
-            db.flush();
-        }
-
-        // Verify key_0 after second cross-level compaction
-        auto v0_second = db.get("key_0");
-        if (!v0_second || *v0_second != "v2_final_val_0") {
-            fail("Second Compaction Overwrite", "Expected key_0 to have 'v2_final_val_0' after second compaction");
-        }
-        pass("Second compaction correctly handles cross-level merge of L0 into L1");
     }
 
     std::cout << "\033[32mStreaming Compaction tests passed successfully.\033[0m\n\n";

@@ -49,12 +49,15 @@ if(NOT APPLE)
 
     add_executable(test_sstable tests/test_sstable.cpp)
     target_link_libraries(test_sstable PRIVATE lsm_core)
+    add_test(NAME test_sstable COMMAND test_sstable)
 
     add_executable(test_compaction_streaming tests/test_compaction_streaming.cpp)
     target_link_libraries(test_compaction_streaming PRIVATE lsm_core)
+    add_test(NAME test_compaction_streaming COMMAND test_compaction_streaming)
 
     add_executable(test_block_cache tests/test_block_cache.cpp)
     target_link_libraries(test_block_cache PRIVATE lsm_core)
+    add_test(NAME test_block_cache COMMAND test_block_cache)
 
     # Benchmark targets
     add_executable(bench_write benchmarks/bench_write.cpp)
