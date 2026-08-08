@@ -2,14 +2,31 @@
 #include <stdexcept>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <cstring>
 #include <limits>
 #include <iostream>
 #include <filesystem>
 
 WAL::WAL(const std::string& path) : path_(path) {
-    fd_ = open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_DIRECT, 0644);
+    // O_APPEND is deliberately gone.
+    //
+    // With an explicit offset on every write, O_APPEND would override it — the
+    // kernel ignores the supplied position for O_APPEND descriptors and resolves
+    // to end-of-file regardless, which is exactly the completion-order
+    // dependency this change removes.
+    fd_ = open(path.c_str(), O_WRONLY | O_CREAT | O_DIRECT, 0644);
     if (fd_ < 0) throw std::runtime_error("WAL: cannot open file with O_DIRECT: " + path);
+
+    // Resume at the end of an existing log rather than at zero, so reopening a
+    // WAL appends to it instead of overwriting from the start.
+    struct stat st;
+    if (fstat(fd_, &st) != 0) {
+        close(fd_);
+        fd_ = -1;
+        throw std::runtime_error("WAL: cannot stat log to establish write offset: " + path);
+    }
+    write_offset_ = static_cast<uint64_t>(st.st_size);
 
     if (io_uring_queue_init(8, &ring_, 0) < 0) {
         close(fd_);
@@ -66,10 +83,14 @@ void WAL::clear() {
         throw std::runtime_error("WAL: failed to remove log during clear: " + ec.message());
     }
 
-    fd_ = open(path_.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_DIRECT, 0644);
+    fd_ = open(path_.c_str(), O_WRONLY | O_CREAT | O_DIRECT, 0644);
     if (fd_ < 0) {
         throw std::runtime_error("WAL: cannot reopen log after clear: " + path_);
     }
+
+    // The file was just removed and recreated, so the next record goes to 0.
+    // Missing this would leave writes landing past a hole the size of the old log.
+    write_offset_ = 0;
 
     if (io_uring_queue_init(8, &ring_, 0) < 0) {
         close(fd_);
@@ -160,7 +181,13 @@ void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string
     // compared against it.
     auto* pending = new PendingWrite{ buf, aligned_size };
 
-    io_uring_prep_write(sqe, fd_, buf, aligned_size, -1); // -1 = current offset (append)
+    // The offset is taken and advanced while mu_ is held, so two concurrent
+    // writers cannot be handed the same position, and the record's location no
+    // longer depends on which completion the kernel reaps first.
+    const uint64_t offset = write_offset_;
+    write_offset_ += aligned_size;
+
+    io_uring_prep_write(sqe, fd_, buf, aligned_size, offset);
     io_uring_sqe_set_data(sqe, pending);
     
     // io_uring_submit() returns a negative errno on failure. The result was

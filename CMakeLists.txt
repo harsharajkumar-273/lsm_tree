@@ -47,6 +47,11 @@ if(NOT APPLE)
     target_link_libraries(test_wal_recovery PRIVATE lsm_core)
     add_test(NAME test_wal_recovery COMMAND test_wal_recovery)
 
+    # WAL submission-order regression tests (issue #14).
+    add_executable(test_wal_ordering tests/test_wal_ordering.cpp)
+    target_link_libraries(test_wal_ordering PRIVATE lsm_core)
+    add_test(NAME test_wal_ordering COMMAND test_wal_ordering)
+
     add_executable(test_sstable tests/test_sstable.cpp)
     target_link_libraries(test_sstable PRIVATE lsm_core)
     add_test(NAME test_sstable COMMAND test_sstable)
