@@ -34,6 +34,11 @@ if(NOT APPLE)
     target_link_libraries(test_skip_list PRIVATE lsm_core)
     add_test(NAME test_skip_list COMMAND test_skip_list)
 
+    # Structural invariants of the lock-free SkipList under contention (issue #19).
+    add_executable(test_skip_list_invariants tests/test_skip_list_invariants.cpp)
+    target_link_libraries(test_skip_list_invariants PRIVATE lsm_core)
+    add_test(NAME test_skip_list_invariants COMMAND test_skip_list_invariants)
+
     add_executable(test_bloom_filter tests/test_bloom_filter.cpp)
     target_link_libraries(test_bloom_filter PRIVATE lsm_core)
     add_test(NAME test_bloom_filter COMMAND test_bloom_filter)
