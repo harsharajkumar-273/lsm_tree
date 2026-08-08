@@ -16,7 +16,7 @@ To guarantee durability before returning a successful write to the client, every
 ### Concurrent MemTable (SkipList)
 Once logged, the key-value pair is inserted into the memory table (MemTable), which is built on a concurrent lock-free **SkipList**:
 - **Lock-Free CAS Updates**: Insertion links node pointers dynamically using atomic Compare-And-Swap (`compare_exchange_weak`/`compare_exchange_strong`) operations. This allows multiple threads to insert entries concurrently without locking the index structure.
-- **In-Place Overwrite Semantics**: If a key already exists, threads perform an atomic store of the new value pointer in the existing node, avoiding duplicate nodes and preventing stale read results.
+- **In-Place Overwrite Semantics**: If a key already exists, threads perform a direct in-place update of the value (`succs[0]->value = value`) in the existing node, avoiding duplicate nodes and preventing stale read results.
 - **Thread-Safe Arena Bump Allocator**: To avoid malloc memory overhead, nodes are allocated from a custom bump-pointer `Arena`. Memory is allocated in chunks (1MB) and protected by a mutex lock, which serializes allocation while keeping SkipList traversals lock-free.
 - **Thread-Local Height Generation**: Height generation uses a `thread_local` random number generator (`std::mt19937`), eliminating lock contention on shared seed variables.
 
@@ -47,4 +47,4 @@ To prevent costly disk reads for keys not in the database, each SSTable maintain
 When Level 0 accumulates 4 or more SSTables, a compaction sweep is triggered to transition them into Level 1:
 1. **Deduplication and Purge**: All active Level 0 and Level 1 files are opened. The compactor reads their entries, keeping only the newest update for each key and discarding tombstones.
 2. **File Partitioning**: Merged entries are segmented into non-overlapping blocks of 1,000 records.
-3. **Atomic Commit**: Each block is written out as a new Level 1 file (`sst-1-xxxxxx.sst`), and the old files are deleted.
+3. **Atomic Staged Commit**: Merged tables are written to temporary `.tmp` files and `fsync`ed to disk. Each `.tmp` file is then atomically renamed to its final Level 1 path (`sst-1-xxxxxx.sst`), ensuring crash-consistency before old input SSTables are unlinked.

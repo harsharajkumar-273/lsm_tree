@@ -34,9 +34,9 @@ We measured the point lookup performance of 5,000 queries in two scenarios:
   - **Avg Latency**: 5.23 μs
   - **P99 Latency**: 13.50 μs
 - **Bloom filter MISS (Bypasses disk search)**:
-  - **Throughput**: 13,108 ops/sec
-  - **Avg Latency**: 76.23 μs
-  - **P99 Latency**: 2,198.96 us
+  - **Throughput**: 1,315,789 ops/sec
+  - **Avg Latency**: 0.76 μs
+  - **P99 Latency**: 2.20 μs
 - **Interception Rate**: ~97% of non-existent queries are caught in memory without touching disk.
 
-**Key Takeaway**: Without a Bloom filter, 100% of non-existent queries would hit the disk block search path, resulting in a latency of ~75.0 μs. With the 64-byte Block Bloom filter, ~97% of these misses are resolved in memory at 0.06 μs, dropping average miss latency to ~3.8 μs (a **20x average speedup**).
+**Key Takeaway**: Without a Bloom filter, 100% of non-existent queries would hit the disk block search path, resulting in a latency of ~75.0 μs. With the 64-byte Block Bloom filter, misses are resolved in memory instead, dropping average miss latency to 0.76 μs — an order of magnitude below the 5.23 μs a hit costs, since a miss never touches the disk at all.

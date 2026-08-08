@@ -8,10 +8,28 @@
 #include <cstring>
 #include <mutex>
 
+// Immutable value cell.
+//
+// An update publishes a new cell and swaps a pointer rather than assigning over
+// the old cell. Assigning a std::optional<std::string> releases the old heap
+// buffer and allocates a new one, and readers hold no lock while touching that
+// field — so a reader could be walking a buffer the writer had already freed.
+// A published cell is never written again, so a reader that has loaded the
+// pointer keeps a stable view of it.
+//
+// Superseded cells stay resident until the Arena is released. Their destructors
+// do run: Node::create registers each one, the same way it registers nodes. A
+// Memtable is flushed and discarded whole, so the cells go with it — which is
+// what lets readers proceed without hazard pointers or epoch reclamation.
+struct ValueSlot {
+    std::optional<std::string> v;
+    explicit ValueSlot(const std::optional<std::string>& value) : v(value) {}
+};
+
 // Lock-Free SkipList Node
 struct Node {
     std::string key;
-    std::optional<std::string> value;
+    std::atomic<const ValueSlot*> value;
     int height;
 
     // Points at `height` link slots carved from the same arena allocation that
@@ -46,8 +64,10 @@ struct Node {
 
         n->next   = links;
         n->key    = k;
-        n->value  = v;
         n->height = h;
+        // Relaxed: the node is private to this thread until the release CAS in
+        // insert() publishes it.
+        n->value.store(makeSlot(arena, v), std::memory_order_relaxed);
 
         // Registered once the node is fully constructed, and registered for
         // every node rather than only the ones that get linked. A node whose
@@ -58,6 +78,13 @@ struct Node {
         arena.registerDestructor(n, [](void* p) { static_cast<Node*>(p)->~Node(); });
 
         return n;
+    }
+
+    static const ValueSlot* makeSlot(Arena& arena, const std::optional<std::string>& v) {
+        void* mem = arena.allocate(sizeof(ValueSlot), alignof(ValueSlot));
+        auto* slot = ::new (mem) ValueSlot(v);
+        arena.registerDestructor(slot, [](void* p) { static_cast<ValueSlot*>(p)->~ValueSlot(); });
+        return slot;
     }
 };
 
@@ -89,8 +116,14 @@ public:
                 // in practice, and the memtable is swapped atomically on flush.
                 // A direct store avoids inserting duplicate nodes, which would cause
                 // find() to return stale data (the first/oldest match).
-                const size_t replaced = succs[0]->value ? succs[0]->value->size() : 0;
-                succs[0]->value = value;
+                const ValueSlot* previous = succs[0]->value.load(std::memory_order_acquire);
+                const size_t replaced = (previous && previous->v) ? previous->v->size() : 0;
+
+                // Swap an immutable cell instead of assigning over a live
+                // std::optional<std::string>, so a concurrent reader can never
+                // observe the field mid-reallocation. Still one store rather
+                // than a second node, so find() keeps returning a single match.
+                succs[0]->value.store(Node::makeSlot(arena_, value), std::memory_order_release);
                 return { false, replaced };
             }
 
@@ -191,7 +224,9 @@ public:
         Node* preds[SkipList::MAX_HEIGHT];
         Node* succs[SkipList::MAX_HEIGHT];
         if (list_.find(key, preds, succs)) {
-            return succs[0]->value;
+            // Acquire pairs with the release store in insert(), so the cell's
+            // contents are visible once its pointer is.
+            return succs[0]->value.load(std::memory_order_acquire)->v;
         }
         return std::nullopt;
     }
@@ -228,7 +263,9 @@ public:
         Node* current_;
         value_type cache_;
         void updateCache() {
-            if (current_) cache_ = {current_->key, current_->value};
+            if (current_) {
+                cache_ = {current_->key, current_->value.load(std::memory_order_acquire)->v};
+            }
         }
     };
 

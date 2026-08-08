@@ -74,6 +74,9 @@ void LeveledCompactor::run(std::vector<std::unique_ptr<SSTable>>& sstables, int&
         std::error_code ec;
         for (const auto& entry : std::filesystem::directory_iterator(data_dir_, ec)) {
             if (entry.path().extension() == ".tmp") {
+                // Best effort by design: a temporary that cannot be removed is
+                // retried on the next run and is never loaded in the meantime,
+                // since the engine only picks up files matching sst-N-*.sst.
                 std::error_code rm_ec;
                 std::filesystem::remove(entry.path(), rm_ec);
             }
@@ -152,6 +155,9 @@ void LeveledCompactor::run(std::vector<std::unique_ptr<SSTable>>& sstables, int&
         flushBuffer();
     } catch (...) {
         for (const auto& [tmp, fin] : staged) {
+            // Also best effort, and deliberately silent: this runs during
+            // unwinding, and a cleanup failure must not displace the exception
+            // that actually explains what went wrong.
             std::error_code ec;
             std::filesystem::remove(tmp, ec);
         }
@@ -167,9 +173,28 @@ void LeveledCompactor::run(std::vector<std::unique_ptr<SSTable>>& sstables, int&
 
     // Phase 3 - only now are the inputs expendable; their contents are durable
     // under the new names.
+    //
+    // Unlike the two best-effort removals above, a failure here is a
+    // correctness hazard rather than untidiness. An input that survives is
+    // still named sst-N-*.sst, so loadSSTables() picks it up on the next start
+    // alongside the L1 tables that replaced it — resurrecting keys the merge
+    // superseded, and undoing deletes whose tombstones were dropped during
+    // compaction.
+    //
+    // It is reported rather than thrown. By this point the replacements are
+    // written, fsynced and renamed into place, so the compaction has in fact
+    // succeeded; raising here would tell the caller otherwise and leave the
+    // engine's in-memory table list inconsistent with the files on disk. The
+    // damage is deferred to the next restart, and an operator who sees this can
+    // remove the file before that happens.
     for (const auto& sst : sstables) {
         std::error_code ec;
         std::filesystem::remove(sst->path(), ec);
+        if (ec) {
+            std::cerr << "[Compaction] Failed to remove compacted input " << sst->path()
+                      << ": " << ec.message()
+                      << ". It will be reloaded on restart and may resurrect superseded keys.\n";
+        }
     }
     fsyncDir(data_dir_);
 

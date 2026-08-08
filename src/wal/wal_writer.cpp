@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <limits>
 #include <iostream>
 #include <filesystem>
 
@@ -21,7 +22,7 @@ WAL::WAL(const std::string& path) : path_(path) {
 WAL::~WAL() {
     {
         std::lock_guard<std::mutex> lock(mu_);
-        reap();
+        drain();
     }
     // Ensure all writes are durable on disk before closing.
     if (fd_ >= 0) fdatasync(fd_);
@@ -42,7 +43,7 @@ void WAL::logDel(const std::string& key) {
 
 void WAL::clear() {
     std::lock_guard<std::mutex> lock(mu_);
-    reap();                     // drain any pending CQEs
+    drain();                     // drain all pending in-flight CQEs synchronously
 
     // Every handle is marked released as it is released, and the removal uses
     // the non-throwing overload. The previous ordering exited the ring and
@@ -76,6 +77,7 @@ void WAL::clear() {
         throw std::runtime_error("WAL: failed to re-init io_uring after clear");
     }
     ring_ready_ = true;
+    pending_cqes_ = 0;
 }
 
 void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string& value) {
@@ -88,6 +90,23 @@ void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string
     if (!failure_.empty()) {
         throw std::runtime_error("WAL: refusing to write, " + failure_);
     }
+    // Lengths are stored as uint32_t on disk, so anything that will not fit is
+    // refused rather than silently truncated.
+    //
+    // `uint32_t klen = key.size()` is a narrowing conversion with no cast and no
+    // diagnostic: a 4 GiB + 100 byte value records a length of 100. The bytes are
+    // still written, so recovery reads 100 of them and then parses the remainder
+    // as the next record — the log is corrupt from that point on, and nothing
+    // reports it. Refusing up front turns silent corruption into an error the
+    // caller can act on.
+    constexpr size_t kMaxFieldBytes = std::numeric_limits<uint32_t>::max();
+    if (key.size() > kMaxFieldBytes || value.size() > kMaxFieldBytes) {
+        throw std::length_error(
+            "WAL: key or value exceeds the 4 GiB limit imposed by the on-disk "
+            "length field (key=" + std::to_string(key.size()) +
+            ", value=" + std::to_string(value.size()) + ")");
+    }
+
     // Allocate 4096-aligned buffer for O_DIRECT
     size_t size = 1 + 4 + 4 + key.size() + value.size() + 4;
     size_t aligned_size = (size + 511) & ~511; // Align to 512 for O_DIRECT
@@ -98,7 +117,10 @@ void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string
 
     char* p = static_cast<char*>(buf);
     *p++ = static_cast<uint8_t>(type);
-    uint32_t klen = key.size(), vlen = value.size();
+    // Explicit casts: the bounds above guarantee these fit, and stating the
+    // conversion stops a future reader wondering whether it was intended.
+    uint32_t klen = static_cast<uint32_t>(key.size());
+    uint32_t vlen = static_cast<uint32_t>(value.size());
     std::memcpy(p, &klen, 4); p += 4;
     std::memcpy(p, &vlen, 4); p += 4;
     std::memcpy(p, key.data(), klen); p += klen;
@@ -122,6 +144,9 @@ void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string
             free(buf);
             throw std::runtime_error(std::string("WAL: io_uring_submit failed while draining: ")
                                      + std::strerror(-flushed));
+        }
+        if (flushed > 0) {
+            pending_cqes_ += static_cast<size_t>(flushed);
         }
         reap();
         sqe = io_uring_get_sqe(&ring_);
@@ -166,6 +191,9 @@ void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string
         throw std::runtime_error(std::string("WAL: io_uring_submit failed: ")
                                  + std::strerror(-submitted));
     }
+    if (submitted > 0) {
+        pending_cqes_ += static_cast<size_t>(submitted);
+    }
 
     // Reap any completed CQEs (non-blocking) to free buffers promptly
     reap();
@@ -203,6 +231,32 @@ void WAL::reap() {
         }
 
         io_uring_cqe_seen(&ring_, cqe);
+        if (pending_cqes_ > 0) {
+            --pending_cqes_;
+        }
+    }
+}
+
+void WAL::drain() {
+    reap();
+    while (pending_cqes_ > 0 && ring_ready_) {
+        struct __kernel_timespec ts;
+        ts.tv_sec = 5;
+        ts.tv_nsec = 0;
+
+        struct io_uring_cqe* cqe = nullptr;
+        int ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+
+        if (ret == -EINTR) {
+            continue;
+        }
+
+        if (ret < 0) {
+            recordFailure("drain wait failed or timed out: " + std::string(std::strerror(-ret)));
+            break;
+        }
+
+        reap();
     }
 }
 

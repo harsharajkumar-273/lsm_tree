@@ -17,8 +17,35 @@ SSTable::SSTable(const std::string& path) : path_(path) {
     uint64_t bloom_offset = readUint64(in);
     index_offset_ = index_offset;
 
+    // index_offset and bloom_offset are read from the footer, so they are as
+    // untrusted as anything else on disk. A corrupted pair sends the seeks
+    // below to arbitrary positions.
+    if (index_offset > file_size || bloom_offset > file_size || index_offset > bloom_offset) {
+        throw std::runtime_error("SSTable: footer offsets fall outside the file: " + path);
+    }
+
     in.seekg(index_offset);
     uint32_t index_count = readUint32(in);
+
+    // Bound the count by what the index region can physically hold.
+    //
+    // index_.resize(index_count) previously took a 32-bit value straight from
+    // disk, so a corrupted count reserved up to 4 billion entries before a
+    // single one was read — the std::bad_alloc this issue describes.
+    //
+    // Every entry costs at least a 4-byte key length, zero key bytes, and an
+    // 8-byte block offset, so twelve bytes is the floor. The region runs from
+    // just past the count to the start of the bloom section. Dividing rather
+    // than multiplying keeps the comparison free of any product that could
+    // overflow.
+    constexpr uint64_t kMinIndexEntryBytes = 4 + 8;
+    const uint64_t index_region = bloom_offset - index_offset;
+    const uint64_t available = index_region >= 4 ? index_region - 4 : 0;
+
+    if (static_cast<uint64_t>(index_count) > available / kMinIndexEntryBytes) {
+        throw std::runtime_error("SSTable: index entry count exceeds file contents: " + path);
+    }
+
     index_.resize(index_count);
     for (auto& [key, offset] : index_) {
         key    = readString(in);

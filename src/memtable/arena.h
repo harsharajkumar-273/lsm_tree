@@ -79,11 +79,30 @@ public:
         if (pad > remaining || bytes > remaining - pad) {
             // A fresh block: size it for the payload plus worst-case padding.
             size_t next_size = std::max(block_size_, bytes + alignment);
-            current_block_ = new char[next_size];
-            blocks_.push_back(current_block_);
+
+            // Capacity is secured before the block exists.
+            //
+            // The order used to be `new` and then push_back. A push_back that
+            // reallocates can throw, and if it did the block had already been
+            // allocated but never recorded in blocks_, so ~Arena could not free
+            // it. Worse than the leak, current_block_ had by then been
+            // reassigned while current_block_size_ still described the previous
+            // block — leaving the arena bounded by the wrong size if anything
+            // caught the exception and carried on using it.
+            //
+            // Reserving first means a throw happens while nothing is owned yet,
+            // and the subsequent push_back has guaranteed capacity so it cannot
+            // reallocate. Member state is then updated only once every step
+            // that can fail has already succeeded.
+            blocks_.reserve(blocks_.size() + 1);
+
+            char* fresh = new char[next_size];
+            blocks_.push_back(fresh);
+
             // current_block_size_ tracks the block actually in hand. The old
             // code compared against block_size_ even after handing out an
             // oversized block, so the bound no longer described the block.
+            current_block_ = fresh;
             current_block_size_ = next_size;
             offset_ = 0;
             pad = padFor(current_block_, alignment);

@@ -25,11 +25,17 @@ jobs:
     - name: Build project targets
       run: cmake --build build --config Release
 
-    - name: Run Unit Tests
+    - name: Run Unit Tests & Compaction Coverage
       run: |
         ./build/test_skip_list
         ./build/test_bloom_filter
-        # Note: test_wal_recovery uses O_DIRECT, which is supported on GitHub Actions runners,
-        # but io_uring might need elevated privileges or fail on older kernels.
-        # We run it and log warnings if skipped.
-        ./build/test_wal_recovery || echo "WAL test warning: io_uring might be blocked by runner container environment."
+        ./build/test_wal_recovery
+        ./build/test_sstable
+        ./build/test_compaction_streaming
+        ./build/test_block_cache
+
+    - name: Run Benchmarks & Regression Detection
+      run: |
+        ./build/bench_write
+        ./build/bench_read
+        ./build/bench_block_bottleneck

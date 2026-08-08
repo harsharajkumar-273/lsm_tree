@@ -1,7 +1,39 @@
-build/
-.DS_Store
+# Build outputs & CMake artifacts
+/build/
+build*/
+bin/
+lib/
 *.o
 *.a
-*.sst
-*.log
+*.so
+*.dylib
+*.dll
+*.exe
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# LSM-Tree runtime files & temporary test directories
 /tmp/
+*.sst
+*.tmp
+*.wal
+*.log
+
+# OS & system artifacts
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*~
+*.user
+CMakeLists.txt.user

@@ -104,12 +104,39 @@ private:
     size_t num_hashes_;
 
     // Single pass to generate two 64-bit hashes (Double Hashing)
+    //
+    // Both hashes are accumulated over the key in the same loop, so this is
+    // still one pass, but they are now independent of one another.
+    //
+    // h2 used to be a bit-mix of h1. That made it a pure function of h1, so the
+    // pair carried 64 bits of entropy rather than 128 and any two keys sharing
+    // h1 shared all eight probe positions — the two hashes double hashing
+    // assumes are independent were the same hash twice over.
+    //
+    // The probe step is also forced odd. Positions are taken as
+    // (h1 + i * h2) % 512, and 512 is 2^9, so a step sharing a factor with it
+    // walks a subgroup instead of the whole block. A step that is a multiple of
+    // 128 makes the eight probes collapse onto fewer than eight distinct bits,
+    // and a step of 0 puts all eight on one bit — that arose for roughly 1 key
+    // in 100 as measured. An odd step is coprime with 512, so the eight
+    // positions are always distinct and can reach every bit in the block.
     void hash(const std::string& key, uint64_t& h1, uint64_t& h2) const {
-        h1 = 14695981039346656037ULL; // FNV-1a
-        for (unsigned char c : key) { h1 ^= c; h1 *= 1099511628211ULL; }
+        h1 = 14695981039346656037ULL; // FNV-1a offset basis
+        h2 = 1099511628211ULL;        // distinct basis for the second hash
 
-        h2 = h1 ^ (h1 >> 33);        // murmur-style mix for the second hash
-        h2 *= 0xff51afd7ed558ccdULL;
+        for (unsigned char c : key) {
+            h1 ^= c;
+            h1 *= 1099511628211ULL;
+
+            h2 ^= c;
+            h2 *= 0x9E3779B97F4A7C15ULL;   // independent multiplier
+            h2 = (h2 << 27) | (h2 >> 37);  // rotate so low bits depend on high ones
+        }
+
+        // Final avalanche, then force the step odd.
         h2 ^= h2 >> 33;
+        h2 *= 0xff51afd7ed558ccdULL;
+        h2 ^= h2 >> 29;
+        h2 |= 1ULL;
     }
 };

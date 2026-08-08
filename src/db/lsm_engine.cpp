@@ -1,5 +1,6 @@
 #include "lsm_engine.h"
 #include <filesystem>
+#include <limits>
 #include <algorithm>
 #include <stdexcept>
 #include <sstream>
@@ -18,29 +19,54 @@ struct SSTFile {
 LSMEngine::LSMEngine(const std::string& data_dir, size_t memtable_max_bytes)
     : data_dir_(data_dir)
     , memtable_max_bytes_(memtable_max_bytes)
-    , wal_(ensureDir(data_dir) + "/wal.log")
+    , lock_fd_(acquireDirectoryLock(ensureDir(data_dir)))
+    , wal_(data_dir + "/wal.log")
     , memtable_(std::make_unique<Memtable>(memtable_max_bytes))
     , compactor_(data_dir)
 {
-    // Acquire exclusive flock
-    lock_fd_ = open((data_dir + "/LOCK").c_str(), O_CREAT | O_RDWR, 0644);
-    if (lock_fd_ < 0 || flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
-        if (lock_fd_ >= 0) close(lock_fd_);
-        throw std::runtime_error("LSMEngine: failed to acquire lock on " + data_dir);
-    }
-
     recoverFromWAL();
     loadSSTables();
 }
 
 LSMEngine::~LSMEngine() {
+    // Persist whatever remains in the memtable before going away.
+    //
+    // Destruction used to release the lock and nothing else, so every entry
+    // written since the last flush was dropped on an ordinary, deliberate
+    // shutdown. The log was no help either: flushMemtable() clears the WAL on
+    // each flush, so the caller had to know to call flush() first — which
+    // nothing documents and nothing enforces.
+    //
+    // Failures are reported and swallowed. A destructor that throws during
+    // stack unwinding terminates the process, which is a worse outcome than the
+    // data loss it would be reporting.
+    try {
+        flush();
+    } catch (const std::exception& e) {
+        std::cerr << "[LSMEngine] flush during shutdown failed: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[LSMEngine] flush during shutdown failed" << std::endl;
+    }
+
     if (lock_fd_ >= 0) {
         flock(lock_fd_, LOCK_UN);
         close(lock_fd_);
     }
 }
 
-const std::string& LSMEngine::ensureDir(const std::string& dir) {
+int LSMEngine::acquireDirectoryLock(const std::string& dir) {
+    // Called from the initialiser list so it completes before wal_ is built,
+    // which is what stops a second process creating or appending to wal.log
+    // while it is still waiting to be refused the lock.
+    int fd = open((dir + "/LOCK").c_str(), O_CREAT | O_RDWR, 0644);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0) close(fd);
+        throw std::runtime_error("LSMEngine: failed to acquire lock on " + dir);
+    }
+    return fd;
+}
+
+std::string LSMEngine::ensureDir(const std::string& dir) {
     std::filesystem::create_directories(dir);
     return dir;
 }
@@ -137,16 +163,56 @@ void LSMEngine::loadSSTables() {
     std::vector<SSTFile> sst_files;
     for (auto& entry : std::filesystem::directory_iterator(data_dir_)) {
         if (entry.path().extension() == ".sst") {
-            std::string filename = entry.path().filename().string();
-            // Parse filename sst-<level>-<counter>.sst
-            if (filename.rfind("sst-", 0) == 0 && filename.size() >= 15) {
-                try {
-                    int level = std::stoi(filename.substr(4, 1));
-                    int counter = std::stoi(filename.substr(6, 6));
-                    sst_files.push_back({entry.path(), level, counter});
-                } catch (...) {
-                    // Ignore malformed files
+            // Parse sst-<level>-<counter> by locating the separator rather than
+            // by fixed offsets.
+            //
+            // substr(4, 1) assumes a one-digit level and substr(6, 6) a
+            // six-digit counter, but makeSSTPath writes the level unpadded and
+            // pads the counter to a *minimum* of six. std::stoi does not reject
+            // the resulting slices — it accepts a leading '-' and stops at the
+            // first non-digit — so the failure is silent misparsing rather than
+            // an exception:
+            //
+            //   sst-10-000000.sst   -> level 1  (not 10), counter 0
+            //   sst-1-1000000.sst   -> level 1, counter 100000 (not 1000000)
+            //   sst-100-000000.sst  -> level 1  (not 100), counter 0
+            //
+            // These values are the sort key below, and the sort decides which
+            // table shadows which. A misparsed level or counter therefore lets a
+            // stale table take precedence over a newer one.
+            const std::string stem = entry.path().stem().string();
+            if (stem.rfind("sst-", 0) != 0) continue;
+
+            const size_t sep = stem.find('-', 4);
+            if (sep == std::string::npos) continue;
+
+            const std::string level_str   = stem.substr(4, sep - 4);
+            const std::string counter_str = stem.substr(sep + 1);
+
+            auto allDigits = [](const std::string& v) {
+                return !v.empty() && v.find_first_not_of("0123456789") == std::string::npos;
+            };
+
+            if (!allDigits(level_str) || !allDigits(counter_str)) {
+                std::cerr << "[LSMEngine] skipping SSTable with unparseable name: "
+                          << stem << ".sst" << std::endl;
+                continue;
+            }
+
+            try {
+                // Parsed as long long so a value beyond int range is reported
+                // rather than wrapping into a plausible-looking sort key.
+                const long long level   = std::stoll(level_str);
+                const long long counter = std::stoll(counter_str);
+                if (level > std::numeric_limits<int>::max() || counter > std::numeric_limits<int>::max()) {
+                    std::cerr << "[LSMEngine] skipping SSTable with out-of-range name: "
+                              << stem << ".sst" << std::endl;
+                    continue;
                 }
+                sst_files.push_back({entry.path(), static_cast<int>(level), static_cast<int>(counter)});
+            } catch (const std::exception& e) {
+                std::cerr << "[LSMEngine] skipping SSTable " << stem << ".sst: "
+                          << e.what() << std::endl;
             }
         }
     }
