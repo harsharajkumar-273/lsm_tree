@@ -33,7 +33,8 @@ int main() {
     SSTable sst(sst_path);
     if (sst.smallestKey() != "key_1000") fail("SSTable", "Smallest key mismatch");
     if (sst.largestKey() != "key_1499") fail("SSTable", "Largest key mismatch");
-    pass("Smallest/Largest Key Metadata Correct");
+    if (sst.indexSize() <= 1) fail("SSTable Block Count", "Expected small dataset to span multiple 4KB blocks");
+    pass("Smallest/Largest Key Metadata & 4KB Block Count Assertions Correct");
 
     // 3. Verify get() lookups across blocks
     for (int i = 0; i < num_entries; i += 25) {
@@ -45,7 +46,7 @@ int main() {
     }
     pass("Point Lookups Across Target 4KB Block Boundaries");
 
-    // 4. Test Large Payload Entry (Bigger than 4KB target block size)
+    // 4. Test Large Payload Entry (16KB per entry > 4KB target block size)
     std::string large_sst_path = "/tmp/test_sstable_dir/large_test.sst";
     std::vector<SSTable::Entry> large_entries;
     std::string large_val(16 * 1024, 'Z'); // 16 KB payload
@@ -55,11 +56,15 @@ int main() {
     SSTable::write(large_sst_path, large_entries);
 
     SSTable large_sst(large_sst_path);
+    if (large_sst.indexSize() != 10) {
+        fail("SSTable Large Block Sizing", "Expected each 16KB large entry to start its own block (expected 10 blocks)");
+    }
+
     auto lval = large_sst.get("lkey_5");
     if (!lval || *lval != large_val) {
         fail("SSTable Large Payload", "Failed to retrieve large payload key lkey_5");
     }
-    pass("Large Payload Block Boundary Bounds Correct");
+    pass("Large Payload Block Sizing Assertions & Boundaries Correct");
 
     // 5. Test Non-existent Key
     auto missing = sst.get("key_9999");

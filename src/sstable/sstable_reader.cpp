@@ -1,9 +1,49 @@
-#include "sstable.h"
-#include <fstream>
-#include <stdexcept>
-#include <algorithm>
+#include "lru_block_cache.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+
+namespace {
+
+static std::vector<SSTable::Entry> parseBlockEntries(const char* data, size_t size) {
+    std::vector<SSTable::Entry> entries;
+    size_t offset = 0;
+    while (offset + 9 <= size) {
+        uint8_t is_tombstone = static_cast<uint8_t>(data[offset]);
+        offset += 1;
+
+        uint32_t key_len = 0;
+        std::memcpy(&key_len, data + offset, 4);
+        offset += 4;
+        if (offset + key_len + 4 > size) break;
+
+        std::string key(data + offset, key_len);
+        offset += key_len;
+
+        uint32_t val_len = 0;
+        std::memcpy(&val_len, data + offset, 4);
+        offset += 4;
+        if (offset + val_len > size) break;
+
+        std::string val(data + offset, val_len);
+        offset += val_len;
+
+        SSTable::Entry e;
+        e.key = std::move(key);
+        e.value = is_tombstone ? std::nullopt : std::optional<std::string>(std::move(val));
+        entries.push_back(std::move(e));
+    }
+    return entries;
+}
+
+} // namespace
 
 SSTable::SSTable(const std::string& path) : path_(path) {
+    fd_ = ::open(path.c_str(), O_RDONLY);
+    if (fd_ < 0) {
+        throw std::runtime_error("SSTable: cannot open: " + path);
+    }
+
     std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in.is_open())
         throw std::runtime_error("SSTable: cannot open: " + path);
@@ -65,6 +105,42 @@ SSTable::SSTable(const std::string& path) : path_(path) {
     }
 }
 
+SSTable::~SSTable() {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+    BlockCache::globalInstance().invalidatePath(path_);
+}
+
+SSTable::SSTable(SSTable&& other) noexcept
+    : path_(std::move(other.path_)),
+      fd_(other.fd_),
+      index_(std::move(other.index_)),
+      bloom_(std::move(other.bloom_)),
+      smallest_key_(std::move(other.smallest_key_)),
+      largest_key_(std::move(other.largest_key_)),
+      index_offset_(other.index_offset_) {
+    other.fd_ = -1;
+}
+
+SSTable& SSTable::operator=(SSTable&& other) noexcept {
+    if (this != &other) {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+        path_ = std::move(other.path_);
+        fd_ = other.fd_;
+        other.fd_ = -1;
+        index_ = std::move(other.index_);
+        bloom_ = std::move(other.bloom_);
+        smallest_key_ = std::move(other.smallest_key_);
+        largest_key_ = std::move(other.largest_key_);
+        index_offset_ = other.index_offset_;
+    }
+    return *this;
+}
+
 std::optional<std::optional<std::string>> SSTable::get(const std::string& key) const {
     if (!bloom_->mayContain(key))
         return std::nullopt;
@@ -83,16 +159,46 @@ std::optional<std::optional<std::string>> SSTable::get(const std::string& key) c
                                   ? index_[lo + 1].second
                                   : index_offset_;
 
-    std::ifstream in(path_, std::ios::binary);
-    if (!in.is_open()) return std::nullopt;
-
-    in.seekg(block_start_offset);
-    while (static_cast<uint64_t>(in.tellg()) < block_end_offset && in.peek() != EOF) {
-        Entry e = readEntry(in);
-        if (e.key == key) return e.value;
-        if (e.key > key)  return std::nullopt;
+    // 1. Check LRU Block Cache first!
+    auto cached_block = BlockCache::globalInstance().get(path_, block_start_offset);
+    if (cached_block.has_value()) {
+        for (const auto& e : *cached_block) {
+            if (e.key == key) return e.value;
+            if (e.key > key)  return std::nullopt;
+        }
+        return std::nullopt;
     }
-    return std::nullopt;
+
+    // 2. Cache MISS -> Read block via persistent fd_ pread (no open/close syscalls!)
+    if (fd_ < 0) {
+        throw std::runtime_error("SSTable: persistent descriptor invalid: " + path_);
+    }
+    if (block_end_offset <= block_start_offset) return std::nullopt;
+
+    size_t block_len = block_end_offset - block_start_offset;
+    std::string buf(block_len, '\0');
+    ssize_t bytes_read = ::pread(fd_, buf.data(), block_len, block_start_offset);
+    if (bytes_read < 0) {
+        throw std::runtime_error("SSTable: pread I/O error on " + path_);
+    }
+    if (static_cast<size_t>(bytes_read) < block_len) {
+        throw std::runtime_error("SSTable: incomplete pread read on " + path_);
+    }
+
+    std::vector<Entry> entries = parseBlockEntries(buf.data(), static_cast<size_t>(bytes_read));
+    std::optional<std::optional<std::string>> result = std::nullopt;
+    for (const auto& e : entries) {
+        if (e.key == key) {
+            result = e.value;
+            break;
+        }
+        if (e.key > key) break;
+    }
+
+    // 3. Populate LRU Block Cache
+    BlockCache::globalInstance().put(path_, block_start_offset, std::move(entries));
+
+    return result;
 }
 
 std::vector<SSTable::Entry> SSTable::readAll() const {
