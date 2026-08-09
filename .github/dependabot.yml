@@ -1,0 +1,55 @@
+version: 2
+updates:
+  # Maintain dependencies for GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      day: "sunday"
+      time: "04:00"
+      timezone: "UTC"
+    reviewers:
+      - "harsharajkumar-273"
+    assignees:
+      - "harsharajkumar-273"
+    commit-message:
+      prefix: "ci(deps)"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  # Maintain dependencies for Docker
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      day: "sunday"
+      time: "05:00"
+      timezone: "UTC"
+    reviewers:
+      - "harsharajkumar-273"
+    assignees:
+      - "harsharajkumar-273"
+    commit-message:
+      prefix: "chore(docker)"
+    labels:
+      - "dependencies"
+      - "docker"
+
+  # Maintain Git submodules (C++ dependencies)
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      day: "sunday"
+      time: "06:00"
+      timezone: "UTC"
+    reviewers:
+      - "harsharajkumar-273"
+    assignees:
+      - "harsharajkumar-273"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "c++"
