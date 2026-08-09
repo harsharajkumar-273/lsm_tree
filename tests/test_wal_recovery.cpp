@@ -1,5 +1,6 @@
 #include "../src/db/lsm_engine.h"
 #include "../src/wal/wal.h"
+#include "../src/format.h"
 #include <iostream>
 #include <cassert>
 #include <filesystem>
@@ -74,16 +75,27 @@ int main() {
         close(fd);
         fail("CRC Corruption", std::string("lseek to end failed: ") + std::strerror(errno));
     }
-    if (size < 1024) {
+    // Offsets are measured from the end of the format header, not from the
+    // start of the file. Since #50 a v2 log opens with a 512-byte header, so
+    // the first record lives at kWalHeaderBytes and the second — the one this
+    // test corrupts — at kWalHeaderBytes + 512.
+    //
+    // The literal 512 here previously pointed at the second record. With a
+    // header in front of it, the same literal points at the first, and the
+    // test corrupted safe_key instead of corrupt_key.
+    const off_t second_record = static_cast<off_t>(lsm::format::kWalHeaderBytes) + 512;
+
+    if (size < second_record + 512) {
         close(fd);
         fail("CRC Corruption",
-             "WAL is " + std::to_string(size) + " bytes; expected at least two 512-byte blocks, "
-             "so there is no second entry to corrupt");
+             "WAL is " + std::to_string(size) + " bytes; expected a header plus at least two "
+             "512-byte blocks, so there is no second entry to corrupt");
     }
 
-    if (lseek(fd, 512, SEEK_SET) != 512) {
+    if (lseek(fd, second_record, SEEK_SET) != second_record) {
         close(fd);
-        fail("CRC Corruption", std::string("lseek to offset 512 failed: ") + std::strerror(errno));
+        fail("CRC Corruption", std::string("lseek to the second record failed: ") +
+                               std::strerror(errno));
     }
 
     char corrupt_byte = 0x03; // Invalid type to cause CRC mismatch

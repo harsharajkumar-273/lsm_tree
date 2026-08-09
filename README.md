@@ -119,6 +119,16 @@ Tested in a privileged Linux environment (Ubuntu 22.04, Kernel 6.12, NVMe SSD):
 
 ---
 
+## On-disk formats
+
+The WAL and SSTable formats carry a magic number and a version field, and
+readers accept both the current version and the historical unversioned one.
+
+**Integers are stored in host-native byte order, so files are not portable
+between architectures.** This is a known limitation rather than an oversight —
+see [docs/FORMAT.md](docs/FORMAT.md) for the layouts, the reasoning, and what
+changing it would involve.
+
 ## ⚡ Core Technical Features
 
 1. **Asynchronous Zero-Copy Logging (`io_uring` + `O_DIRECT`)**:  

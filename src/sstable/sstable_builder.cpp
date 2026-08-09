@@ -1,4 +1,5 @@
 #include "sstable.h"
+#include "../format.h"
 #include <fstream>
 #include <stdexcept>
 #include <fcntl.h>
@@ -119,6 +120,16 @@ void SSTable::write(const std::string& path, const std::vector<Entry>& entries) 
 
     writeUint64(out, index_offset);
     writeUint64(out, bloom_offset);
+
+    // Format identification, appended after the offsets rather than before.
+    //
+    // The reader finds the offsets by seeking back from the end of the file, so
+    // appending keeps that seek a fixed distance and lets a v1 file be told
+    // apart by simply not having a magic where a v2 file does. Prepending would
+    // have meant the reader could not locate the magic without first knowing
+    // which version it was reading.
+    writeUint32(out, lsm::format::kSSTableMagic);
+    writeUint32(out, lsm::format::kCurrentVersion);
 
     // Stream state is checked rather than assumed.
     //

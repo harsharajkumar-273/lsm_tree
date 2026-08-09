@@ -1,4 +1,5 @@
 #include "wal.h"
+#include "../format.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -92,8 +93,51 @@ std::vector<WAL::Entry> WAL::recover() const {
     close(rfd);
 
     std::vector<Entry> entries;
-    size_t offset = 0;
     size_t total = buf.size();
+
+    // Format detection.
+    //
+    // A v2 log opens with a 512-byte header carrying a magic and a version; a
+    // v1 log opens directly with a record, whose first byte is a type tag (1 or
+    // 2). The two cannot be confused: no v1 log can begin with the four bytes
+    // 'L','S','M','W'.
+    //
+    // Records in a v2 log therefore start at 512, and because the header is a
+    // whole block every record stays on the same 512-byte grid as before. The
+    // resynchronisation arithmetic below -- `((entry_start / 512) + 1) * 512`
+    // -- is untouched, which is what keeps the block-skip recovery from #29
+    // working exactly as it did.
+    size_t offset = 0;
+    uint32_t detected_version = lsm::format::kVersion1;
+
+    if (total >= 4) {
+        uint32_t magic = 0;
+        std::memcpy(&magic, buf.data(), 4);
+        if (magic == lsm::format::kWalMagic) {
+            // A header is present, so the rest of it must be too. A log
+            // truncated inside its own header is refused rather than parsed
+            // from an arbitrary offset -- falling through here would hand the
+            // record loop a partial header and it would resynchronise onto
+            // whatever happened to follow.
+            if (total < lsm::format::kWalHeaderBytes) {
+                throw std::runtime_error(
+                    "WAL: log carries a v2 magic but is only " + std::to_string(total) +
+                    " bytes, shorter than its " + std::to_string(lsm::format::kWalHeaderBytes) +
+                    "-byte header. The file is truncated.");
+            }
+
+            std::memcpy(&detected_version, buf.data() + 4, 4);
+            if (detected_version != lsm::format::kVersion2) {
+                throw std::runtime_error(
+                    "WAL: log declares format version " + std::to_string(detected_version) +
+                    ", which this build does not understand (it writes version " +
+                    std::to_string(lsm::format::kCurrentVersion) +
+                    "). Refusing to guess at the layout.");
+            }
+
+            offset = lsm::format::kWalHeaderBytes;
+        }
+    }
 
     while (offset < total) {
         // Each WAL entry is written as a 512-byte-aligned block (for O_DIRECT).
