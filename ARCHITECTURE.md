@@ -4,6 +4,28 @@ This document details the low-level systems design and architecture of this high
 
 ---
 
+## High-Level Architecture Diagram
+
+```mermaid
+graph TD
+    Client[Client] -->|Write/PUT| WAL[(Write-Ahead Log)]
+    Client -->|Write/PUT| MemTable[MemTable (SkipList)]
+    Client -->|Read/GET| MemTable
+    MemTable -.->|Flush| L0[Level 0 SSTables]
+    
+    subgraph Disk Storage
+        WAL
+        L0
+        L1[Level 1 SSTables]
+    end
+    
+    L0 -->|Compaction| L1
+    Client -->|Read/GET| L0
+    Client -->|Read/GET| L1
+```
+
+---
+
 ## 1. The Write Path
 
 ### Write-Ahead Log (WAL) with `io_uring`
