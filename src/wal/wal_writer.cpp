@@ -1,4 +1,5 @@
 #include "wal.h"
+#include "../format.h"
 #include <stdexcept>
 #include <fcntl.h>
 #include <unistd.h>
@@ -27,6 +28,15 @@ WAL::WAL(const std::string& path) : path_(path) {
         throw std::runtime_error("WAL: cannot stat log to establish write offset: " + path);
     }
     write_offset_ = static_cast<uint64_t>(st.st_size);
+
+    // A new or empty log gets the v2 header before any record. An existing log
+    // is left exactly as it is: if it has no header it is v1, and recovery
+    // detects that by the absence of the magic rather than by any flag we keep
+    // here. Writing a header into an existing v1 log would corrupt its first
+    // record.
+    if (write_offset_ == 0) {
+        writeFormatHeader();
+    }
 
     if (io_uring_queue_init(8, &ring_, 0) < 0) {
         close(fd_);
@@ -88,8 +98,7 @@ void WAL::clear() {
         throw std::runtime_error("WAL: cannot reopen log after clear: " + path_);
     }
 
-    // The file was just removed and recreated, so the next record goes to 0.
-    // Missing this would leave writes landing past a hole the size of the old log.
+    // The file was just removed and recreated, so it starts empty.
     write_offset_ = 0;
 
     if (io_uring_queue_init(8, &ring_, 0) < 0) {
@@ -99,6 +108,49 @@ void WAL::clear() {
     }
     ring_ready_ = true;
     pending_cqes_ = 0;
+
+    // The recreated log needs its header before the first record, and the ring
+    // has to exist first because the header goes out through the same io_uring
+    // write path as everything else.
+    writeFormatHeader();
+}
+
+// Write the 512-byte v2 header at offset 0 and leave write_offset_ past it.
+//
+// Uses plain pwrite rather than io_uring: this runs once at open, before any
+// record is queued, so there is nothing to overlap with and no benefit to the
+// asynchronous path. It also has to be durable before the first record lands --
+// a record written ahead of its header would leave a log that recovery reads as
+// v1 and misparses.
+void WAL::writeFormatHeader() {
+    void* buf = nullptr;
+    if (posix_memalign(&buf, 4096, lsm::format::kWalHeaderBytes) != 0) {
+        throw std::runtime_error("WAL: memalign failed for format header");
+    }
+    std::memset(buf, 0, lsm::format::kWalHeaderBytes);
+
+    char* p = static_cast<char*>(buf);
+    const uint32_t magic = lsm::format::kWalMagic;
+    const uint32_t version = lsm::format::kCurrentVersion;
+    std::memcpy(p, &magic, 4);
+    std::memcpy(p + 4, &version, 4);
+
+    ssize_t written = 0;
+    while (written < static_cast<ssize_t>(lsm::format::kWalHeaderBytes)) {
+        const ssize_t n = pwrite(fd_, static_cast<char*>(buf) + written,
+                                 lsm::format::kWalHeaderBytes - written, written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            const int err = errno;
+            free(buf);
+            throw std::runtime_error(std::string("WAL: failed to write format header: ") +
+                                     std::strerror(err));
+        }
+        written += n;
+    }
+    free(buf);
+
+    write_offset_ = lsm::format::kWalHeaderBytes;
 }
 
 void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string& value) {

@@ -36,6 +36,7 @@ public:
     const std::string& largestKey()  const { return largest_key_; }
     const std::string& path()        const { return path_; }
     uint64_t indexOffset()            const { return index_offset_; }
+    uint32_t formatVersion()          const { return format_version_; }
     size_t indexSize()               const { return index_.size(); }
     int fd()                         const { return fd_; }
 
@@ -47,6 +48,10 @@ private:
     std::string smallest_key_;
     std::string largest_key_;
     uint64_t file_size_ = 0;
+    // Which on-disk format this file was read as. v1 has no header; v2 carries
+    // a magic and version. Exposed so callers and tests can assert on it.
+    uint32_t format_version_ = 0;
+
     uint64_t index_offset_ = 0;
 
     uint64_t findBlock(const std::string& key) const;

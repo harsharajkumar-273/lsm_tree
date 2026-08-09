@@ -73,6 +73,9 @@ private:
     //
     // Assigning the offset here, under mu_, fixes each record's position at
     // submission time. Completion order stops mattering.
+    // Writes the 512-byte v2 format header at offset 0 (see src/format.h).
+    void writeFormatHeader();
+
     uint64_t write_offset_ = 0;
 
     void recordFailure(const std::string& detail);

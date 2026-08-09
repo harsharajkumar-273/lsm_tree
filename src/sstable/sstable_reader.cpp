@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include "../format.h"
 
 namespace {
 
@@ -50,13 +51,53 @@ SSTable::SSTable(const std::string& path) : path_(path) {
 
     uint64_t file_size = in.tellg();
     file_size_ = file_size;
-    if (file_size < 16)
+    if (file_size < static_cast<std::streamoff>(lsm::format::kSSTableFooterV1Bytes))
         throw std::runtime_error("SSTable: file too small: " + path);
 
-    in.seekg(-16, std::ios::end);
+    // Format detection.
+    //
+    // A v2 file ends with [index_offset u64][bloom_offset u64][magic u32]
+    // [version u32]; a v1 file ends after the two offsets. Reading the last
+    // eight bytes and looking for the magic distinguishes them.
+    //
+    // A v1 file cannot produce a false positive here: those eight bytes are the
+    // tail of bloom_offset, a file position, which would have to coincidentally
+    // equal the magic in its low word and a valid version number in its high
+    // word.
+    uint32_t detected_version = lsm::format::kVersion1;
+    uint64_t footer_bytes = lsm::format::kSSTableFooterV1Bytes;
+
+    if (file_size >= static_cast<std::streamoff>(lsm::format::kSSTableFooterV2Bytes)) {
+        in.seekg(-8, std::ios::end);
+        const uint32_t magic = readUint32(in);
+        const uint32_t version = readUint32(in);
+
+        if (magic == lsm::format::kSSTableMagic) {
+            if (version != lsm::format::kVersion2) {
+                throw std::runtime_error(
+                    "SSTable: file declares format version " + std::to_string(version) +
+                    ", which this build does not understand (it writes version " +
+                    std::to_string(lsm::format::kCurrentVersion) + "): " + path);
+            }
+            detected_version = lsm::format::kVersion2;
+            footer_bytes = lsm::format::kSSTableFooterV2Bytes;
+        }
+    }
+
+    format_version_ = detected_version;
+
+    in.seekg(-static_cast<std::streamoff>(footer_bytes), std::ios::end);
     uint64_t index_offset = readUint64(in);
     uint64_t bloom_offset = readUint64(in);
     index_offset_ = index_offset;
+
+    // The stream is the only report of a short or failed read here. Without
+    // this, a file truncated between the offsets and the magic leaves both
+    // values partially filled and the bounds check below runs on whatever the
+    // stream happened to leave in them.
+    if (!in) {
+        throw std::runtime_error("SSTable: failed to read the footer, file is truncated: " + path);
+    }
 
     // index_offset and bloom_offset are read from the footer, so they are as
     // untrusted as anything else on disk. A corrupted pair sends the seeks
@@ -216,8 +257,15 @@ std::vector<SSTable::Entry> SSTable::readAll() const {
     std::ifstream in(path_, std::ios::binary);
     if (!in.is_open()) return {};
     std::vector<Entry> entries;
-    // Read the index_offset from the footer
-    in.seekg(-16, std::ios::end);
+    // Read the index_offset from the footer.
+    //
+    // The distance depends on the format: v2 appends a magic and a version
+    // after the two offsets, so seeking a fixed -16 would land inside them and
+    // read the magic as an offset. format_version_ was established by open().
+    const std::streamoff footer = static_cast<std::streamoff>(
+        format_version_ == lsm::format::kVersion2 ? lsm::format::kSSTableFooterV2Bytes
+                                             : lsm::format::kSSTableFooterV1Bytes);
+    in.seekg(-footer, std::ios::end);
     uint64_t idx_off = readUint64(in);
     in.seekg(0);
     while (static_cast<uint64_t>(in.tellg()) < idx_off && in.peek() != EOF) {
@@ -331,7 +379,20 @@ std::unique_ptr<BloomFilter> SSTable::deserializeBloom(std::ifstream& in) {
     const uint64_t file_size = static_cast<uint64_t>(in.tellg());
     in.seekg(here);
 
-    constexpr uint64_t kFooterBytes = 16;
+    // The smaller of the two footer sizes.
+    //
+    // This function is static and cannot consult the file's detected version.
+    // My first attempt used the larger (v2) size on the reasoning that a
+    // stricter bound is the safe direction -- and it rejected a file the
+    // builder had just written, because on a small table the bloom section is
+    // only a block or two and eight bytes is enough to push it under the
+    // threshold.
+    //
+    // The purpose here is refusing an implausible allocation, not validating
+    // the layout byte-for-byte, so the looser bound is the correct one: it
+    // still bounds num_blocks by the file size and cannot reject a legitimate
+    // file of either version.
+    constexpr uint64_t kFooterBytes = lsm::format::kSSTableFooterV1Bytes;
     constexpr uint64_t kBlockBytes = 64;
     const uint64_t pos = static_cast<uint64_t>(here);
     const uint64_t available = (file_size >= pos + kFooterBytes) ? (file_size - pos - kFooterBytes) : 0;
