@@ -3,7 +3,7 @@
 # ⚡ High-Performance LSM-Tree Storage Engine
 
 **A production-grade, low-latency C++20 Log-Structured Merge-Tree (LSM-tree) key-value engine.**  
-*Leveraging Linux `io_uring` + `O_DIRECT` for zero-copy WAL logging, lock-free concurrent SkipList MemTables, 64-byte cache-aligned Block Bloom Filters, and Leveled Compaction.*
+*Leveraging Linux `io_uring` + `O_DIRECT` for zero-copy WAL logging, lock-free concurrent SkipList MemTables, 64-byte cache-aligned Block Bloom Filters, Leveled Compaction, and automated WAL crash recovery.*
 
 [![Language](https://img.shields.io/badge/C%2B%2B-20-blue.svg?style=for-the-badge&logo=cplusplus)](https://en.cppreference.com/w/cpp/20)
 [![Kernel](https://img.shields.io/badge/Linux_Kernel-5.1%2B-orange.svg?style=for-the-badge&logo=linux)](https://kernel.org)
@@ -15,11 +15,12 @@
 
 ---
 
-> ### 🚀 HERO PERFORMANCE BENCHMARKS
+> ### 🚀 PRODUCTION STORAGE & RELIABILITY BENCHMARKS
 > * **Sequential Write (`io_uring` WAL)**: **254,095 ops/sec** | **Avg Latency**: **3.85 μs** | **P99 Latency**: **32.21 μs**
+> * **Crash Recovery SLA (WAL Replay)**: **< 0.85 ms** for 5,000 pending transactions with **CRC32 corruption detection**
 > * **Point Read (Bloom HIT - Disk Seek)**: **189,263 ops/sec** | **Avg Latency**: **5.23 μs** | **P99 Latency**: **13.50 μs**
 > * **Point Read (Bloom MISS - Bypasses Disk)**: **1,315,789 ops/sec** | **Avg Latency**: **0.76 μs** | **P99 Latency**: **2.20 μs**
-> * **Zero Page-Cache Locks**: Direct Memory Access (DMA) via `O_DIRECT` provides **100x higher write throughput** and **34x lower P99 latency** over traditional `write` + `fdatasync`.
+> * **Zero Page-Cache Locks**: Direct Memory Access (DMA) via `O_DIRECT` provides **100x higher write throughput** over traditional `write` + `fdatasync`.
 
 ---
 
@@ -34,7 +35,7 @@
 
 ## 🛠️ How It Was Achieved (Engineering Deep-Dive)
 
-To achieve **254k ops/sec** write throughput and **0.76μs** point lookups, four core low-level systems optimizations were engineered:
+To achieve **254k ops/sec** write throughput, **0.76μs** point lookups, and **automated crash recovery**, four core low-level systems modules were engineered:
 
 ### 1. `io_uring` Ring Queues + `O_DIRECT` Zero-Copy Logging
 - **Direct Memory Access (DMA)**: File descriptors open with `O_DIRECT`, bypassing the kernel page cache entirely.
@@ -58,9 +59,9 @@ io_uring_submit(&ring_); // Non-blocking kernel submission
 - **Cache Line Partitioning**: Standard Bloom filters scatter bit lookups across random memory addresses, causing up to 8 cache misses per query. Our filter partitions bits into 64-byte blocks matching exact CPU L1 cache line sizes.
 - **Single-Pass Double Hashing**: Computes FNV-1a and Murmur mix hashes in a single pass to map keys to a single 64-byte block, guaranteeing **at most 1 cache miss penalty**.
 
-### 4. Single-Pass Leveled Compaction (L0 → L1)
-- **Multiway Merge Sort**: Merges overlapping Level 0 SSTables into non-overlapping Level 1 SSTables using a min-heap priority queue across sorted iterators.
-- **Tombstone Purging**: Single-pass deduplication discards stale overwrite keys and purges deleted records (`DELETE` tombstones), keeping storage growth strictly bounded.
+### 4. Leveled Compaction & Automated Crash Recovery
+- **Leveled Compaction (L0 → L1)**: Merges overlapping Level 0 SSTables into non-overlapping Level 1 SSTables via single-pass multiway merge sort. Purges `DELETE` tombstones and obsolete keys in background execution.
+- **Automated WAL Crash Recovery**: On process restart, the engine scans the WAL file, validates CRC32 checksums, skips corrupted entries, and replays valid transactions into memory in **< 0.85ms**.
 
 ---
 
@@ -88,7 +89,10 @@ sequenceDiagram
         SST->>SST: Leveled Compaction sweep (Merge L0 -> L1, purge tombstones)
     end
 
-    Note over Client, SST: READ PATH (Fast Fail Negative Queries)
+    Note over Client, SST: READ PATH & CRASH RECOVERY
+    alt Process Restart / Crash Recovery
+        Client->>WAL: Replay log -> Verify CRC32 checksums -> Restore MemTable (<0.85ms)
+    end
     Client->>MemTable: Traversal search O(log N)
     alt Found in MemTable
         MemTable-->>Client: Return active value
@@ -109,72 +113,41 @@ sequenceDiagram
 
 Tested in a privileged Linux environment (Ubuntu 22.04, Kernel 6.12, NVMe SSD):
 
-| Operation | Implementation | Throughput | Avg Latency | P99 Latency | Memory / Cache Misses |
+| Operation | Implementation | Throughput | Avg Latency | P99 Latency | Reliability & Safety |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Sequential Write** | **`io_uring` + `O_DIRECT`** | **254,095 ops/sec** | **3.85 μs** | **32.21 μs** | 0 Page-Cache Overhead |
-| Sequential Write | Sync `write` + `fdatasync` | 2,525 ops/sec | 395.75 μs | 1,115.92 μs | High Page-Cache Locks |
+| **Sequential Write** | **`io_uring` + `O_DIRECT`** | **254,095 ops/sec** | **3.85 μs** | **32.21 μs** | 0 Page-Cache Locks |
+| Sequential Write | Sync `write` + `fdatasync` | 2,525 ops/sec | 395.75 μs | 1,115.92 μs | High Flush Stalls |
 | **Point Read (Bloom HIT)** | **Sparse Index + Disk Seek** | **189,263 ops/sec** | **5.23 μs** | **13.50 μs** | 1 Disk I/O |
 | **Point Read (Bloom MISS)**| **64-Byte Block Bloom** | **1,315,789 ops/sec**| **0.76 μs** | **2.20 μs** | **≤ 1 Cache Miss (0 Disk I/O)** |
-| **Crash Recovery** | **WAL Log Replay** | **5,882,352 ops/sec**| **0.85 ms** / 5k keys | — | CRC32 Checksum Verified |
+| **WAL Crash Recovery** | **Log Replay & CRC Check** | **5,882,352 ops/sec**| **0.85 ms** / 5k keys | — | **CRC32 Integrity Verified** |
 
 ---
 
-## ⚡ Core Technical Features
+## 🧪 Systematic Test Suite
 
-1. **Asynchronous Zero-Copy Logging (`io_uring` + `O_DIRECT`)**:  
-   Bypasses standard OS buffered I/O. Uses 512-byte aligned buffers (`posix_memalign`) submitted directly to `io_uring` ring queues. CRC32 checksums protect every entry against silent hardware corruption.
-2. **Lock-Free Concurrent MemTable (SkipList)**:  
-   Concurrent insertions swap pointers using atomic Compare-And-Swap (`std::atomic::compare_exchange_weak`). A thread-safe bump-pointer **Arena Allocator** avoids `malloc` heap fragmentation, and `thread_local std::mt19937` seeds prevent thread lock contention during random height generation.
-3. **64-Byte Cache-Aligned Block Bloom Filter**:  
-   Standard Bloom filters probe random bit addresses across memory, causing up to 8 cache misses per query. Our Block Bloom Filter partitions bits into 64-byte blocks matching exact CPU cache lines, guaranteeing **at most 1 cache miss**.
-4. **Leveled Compaction (L0 → L1)**:  
-   Merges overlapping Level 0 files into size-partitioned, non-overlapping Level 1 files. Deduplicates keys, removes tombstones, and bounds read amplification.
+```bash
+# Build test suite
+mkdir -p build && cd build && cmake .. && make -j$(nproc)
+
+# Run tests
+./test_skip_list      # Concurrent SkipList correctness & CAS thread safety
+./test_bloom_filter   # Cache-aligned Bloom Filter false-positive rates
+./test_wal_recovery   # Process crash simulation, WAL replay & CRC32 corruption validation
+```
 
 ---
 
 ## 🚀 Quick Start (< 1 Minute)
-
-### Option A: Run in Docker (Recommended for macOS & Windows)
-Because `io_uring` relies on Linux kernel primitives, Docker provides the fastest isolated test environment:
 
 ```bash
 # Clone repository
 git clone https://github.com/harsharajkumar-273/lsm_tree.git
 cd lsm_tree
 
-# Build and run unit tests & benchmarks in privileged Linux container
+# Build and run unit tests & benchmarks in privileged Docker container
 docker build -t lsm-engine .
 docker run --rm --privileged lsm-engine
 ```
-
-### Option B: Native Linux Build (Kernel 5.1+)
-```bash
-# Install build tools & liburing
-sudo apt-get install -y build-essential cmake liburing-dev pkg-config
-
-# Build project
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
-
-# Run test binaries
-./test_skip_list      # Concurrent SkipList correctness & CAS thread safety
-./test_bloom_filter   # Cache-aligned Bloom Filter false-positive rates
-./test_wal_recovery   # Crash recovery & CRC32 corruption validation
-./bench_write         # Benchmark io_uring WAL throughput
-./bench_read          # Benchmark Bloom filter point lookups
-```
-
----
-
-## 🗺️ Open-Source Roadmap & Good First Issues
-
-We welcome community contributions! Here are active architectural roadmap items:
-
-- [ ] **[Issue #1] Zstd/LZ4 Data Block Compression**: Compress SSTable data blocks before writing to disk to reduce disk footprint by 40%+.
-- [ ] **[Issue #2] RESP Server Wrapper (Redis Protocol)**: Build a TCP socket server wrapper supporting the Redis Serialization Protocol (RESP) so users can query the engine via `redis-cli`.
-- [ ] **[Issue #3] LRU Block Cache**: Implement an in-memory LRU block cache (similar to RocksDB) to store frequently accessed sparse index data blocks.
-- [ ] **[Issue #4] Multi-Version Concurrency Control (MVCC)**: Add sequence numbers to key entries to support point-in-time snapshot reads.
 
 ---
 
