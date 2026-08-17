@@ -15,7 +15,7 @@
 # otherwise opaque: the image builds cleanly and the container starts, then
 # dies on the first write with an error that does not mention capabilities.
 # ---------------------------------------------------------------------------
-FROM ubuntu:22.04
+FROM ubuntu:26.04
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
