@@ -1,0 +1,42 @@
+name: Feature Request
+description: Suggest an idea or new feature for lsm_tree
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for your interest in improving lsm_tree! Please provide a clear and detailed description of the feature you are proposing.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Is your feature request related to a problem?
+      description: A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+      placeholder: Currently, when writing large values, the Write-Ahead Log becomes a bottleneck...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you'd like
+      description: A clear and concise description of what you want to happen.
+      placeholder: I propose adding batched asynchronous I/O (io_uring) for the WAL...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Describe alternatives you've considered
+      description: A clear and concise description of any alternative solutions or features you've considered.
+      placeholder: We could also memory-map the WAL, but...
+
+  - type: checkboxes
+    id: pr
+    attributes:
+      label: Contribution
+      description: Are you willing to submit a Pull Request to implement this feature?
+      options:
+        - label: Yes, I would like to submit a PR for this.

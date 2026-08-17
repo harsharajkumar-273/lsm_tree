@@ -1,0 +1,72 @@
+name: Bug Report
+description: File a bug report to help us improve the lsm_tree database engine
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report! Please provide as much detail as possible.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+      placeholder: E.g., The SSTable compaction process crashes when merging two levels...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Describe the exact steps to reproduce the issue or provide a minimal reproducible example (MRE).
+      placeholder: |
+        1. Insert 1,000,000 records
+        2. Trigger manual compaction
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      description: What OS are you running this on? (e.g., Ubuntu 22.04, Windows 11, macOS 14)
+      placeholder: Ubuntu 22.04
+    validations:
+      required: true
+
+  - type: input
+    id: compiler
+    attributes:
+      label: Compiler Version
+      description: Which C++ compiler and version are you using? (e.g., GCC 11.4, Clang 15)
+      placeholder: GCC 11.4
+    validations:
+      required: true
+
+  - type: input
+    id: cmake
+    attributes:
+      label: CMake Version
+      description: What version of CMake are you using?
+      placeholder: 3.22.1
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Core Dump Stacktrace
+      description: Paste any relevant logs, terminal output, or GDB stacktraces here.
+      render: shell
