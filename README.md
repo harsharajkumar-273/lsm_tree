@@ -1,159 +1,127 @@
-<div align="center">
+# LSM-Tree Storage Engine
 
-# ⚡ High-Performance LSM-Tree Storage Engine
+A C++17 log-structured merge-tree key-value engine for Linux: an `io_uring` + `O_DIRECT` write-ahead log, a lock-free SkipList MemTable, cache-line-aligned Block Bloom filters, and leveled compaction.
 
-**A production-grade, low-latency C++20 Log-Structured Merge-Tree (LSM-tree) key-value engine.**  
-*Leveraging Linux `io_uring` + `O_DIRECT` for zero-copy WAL logging, lock-free concurrent SkipList MemTables, 64-byte cache-aligned Block Bloom Filters, Leveled Compaction, and automated WAL crash recovery.*
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat-square&logo=cplusplus)](https://en.cppreference.com/w/cpp/17)
+[![Linux io_uring](https://img.shields.io/badge/Linux-io__uring-FCC624?style=flat-square&logo=linux&logoColor=black)](https://kernel.dk/io_uring.pdf)
+[![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white)](.github/workflows)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
-[![Language](https://img.shields.io/badge/C%2B%2B-20-blue.svg?style=for-the-badge&logo=cplusplus)](https://en.cppreference.com/w/cpp/20)
-[![Kernel](https://img.shields.io/badge/Linux_Kernel-5.1%2B-orange.svg?style=for-the-badge&logo=linux)](https://kernel.org)
-[![I/O Interface](https://img.shields.io/badge/I%2FO-io__uring-red.svg?style=for-the-badge)](https://kernel.dk/io_uring.pdf)
-[![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
-[![Docker](https://img.shields.io/badge/Docker-Supported-blue.svg?style=for-the-badge&logo=docker)](https://www.docker.com/)
+| | |
+|---|---|
+| **Write path** | 254,095 writes/sec, 3.85 µs avg, 32.21 µs P99 (`io_uring` + `O_DIRECT`, not fsynced per record) |
+| **Read path** | 189,263 reads/sec on Bloom hits; 1,315,789 reads/sec on Bloom misses (0.76 µs avg, no disk access) |
+| **Tests** | 8 test programs: SkipList (incl. invariants), Bloom filter, WAL ordering and crash recovery, SSTable, block cache, streaming compaction |
+| **Built by** | Started by [@harsharajkumar-273](https://github.com/harsharajkumar-273); developed with contributors during ELUSOC 2026 (see [Credits](#credits)) |
 
-</div>
-
----
-
-> ### 🚀 PRODUCTION STORAGE & RELIABILITY BENCHMARKS
-> * **Sequential Write (`io_uring` WAL)**: **254,095 ops/sec** | **Avg Latency**: **3.85 μs** | **P99 Latency**: **32.21 μs**
-> * **Crash Recovery SLA (WAL Replay)**: **< 0.85 ms** for 5,000 pending transactions with **CRC32 corruption detection**
-> * **Point Read (Bloom HIT - Disk Seek)**: **189,263 ops/sec** | **Avg Latency**: **5.23 μs** | **P99 Latency**: **13.50 μs**
-> * **Point Read (Bloom MISS - Bypasses Disk)**: **1,315,789 ops/sec** | **Avg Latency**: **0.76 μs** | **P99 Latency**: **2.20 μs**
-> * **Zero Page-Cache Locks**: Direct Memory Access (DMA) via `O_DIRECT` provides **100x higher write throughput** over traditional `write` + `fdatasync`.
->
-> These aren't narrated numbers — they're the direct output of [`benchmarks/bench_write.cpp`](benchmarks/bench_write.cpp) and [`benchmarks/bench_read.cpp`](benchmarks/bench_read.cpp), recorded in [`benchmarks/results.md`](benchmarks/results.md). Run `./run_all.sh` after building to reproduce them yourself.
+All numbers come from [`benchmarks/results.md`](benchmarks/results.md) and can be reproduced with `./run_all.sh`.
 
 ---
 
-## 💡 The "Why" vs. "How" (Systems Rationale)
+## How it works
 
-* **The Bottleneck (Why standard databases stall)**:  
-  Traditional database write paths use synchronous system calls (`write`, `fdatasync`) to write-ahead logs (WAL). Under heavy write traffic, this causes kernel page-cache lock contention, thread context-switching overhead, and unpredictable I/O flush stalls.
-* **The Low-Level Fix (How we solved it)**:  
-  This engine uses Linux **`io_uring`** combined with **`O_DIRECT`**. Requests submit directly to the kernel submission ring queue (SQ), executing non-blocking hardware-level **Direct Memory Access (DMA)** straight to physical disk blocks. On the read path, negative queries fail fast in **0.06 μs** by using **64-byte CPU cache-aligned Block Bloom Filters** that restrict filter bit probes to at most **one CPU cache line miss**.
+**Write path.** Every `PUT`/`DELETE` is appended to the WAL, then inserted into the MemTable.
 
----
+- The WAL file is opened with `O_DIRECT`, so writes skip the page cache. Buffers are 512-byte aligned (`posix_memalign`) as `O_DIRECT` requires.
+- Appends are submitted through an `io_uring` submission queue and reaped from the completion queue, so callers don't block on each write. A mutex serializes submission so log order matches write order.
+- The MemTable is a SkipList with atomic forward pointers. Inserts link nodes with compare-and-swap, so traversals never take a lock. Nodes come from a bump-pointer `Arena` in 1 MB chunks.
 
-## 🛠️ How It Was Achieved (Engineering Deep-Dive)
+**Flush and compaction.** When the MemTable passes its size limit (4 MiB by default) it is flushed to a sorted Level-0 SSTable and the WAL is cleared. Once there are 4 L0 tables, leveled compaction merges them into non-overlapping L1 tables with a streaming k-way merge (bounded memory) and drops tombstones.
 
-To achieve **254k ops/sec** write throughput, **0.76μs** point lookups, and **automated crash recovery**, four core low-level systems modules were engineered:
+**Read path.** Lookups check the MemTable, then L0 tables newest-first, then the one L1 table whose key range matches. Before touching disk, each SSTable's Block Bloom filter is probed. The filter maps every key to a single 64-byte block, so a probe costs at most one cache-line miss and absent keys never reach disk.
 
-### 1. `io_uring` Ring Queues + `O_DIRECT` Zero-Copy Logging
-- **Direct Memory Access (DMA)**: File descriptors open with `O_DIRECT`, bypassing the kernel page cache entirely.
-- **Page-Aligned Memory Allocation**: Memory buffers are allocated using `posix_memalign(&buf, 512, size)` to satisfy hardware 512-byte block alignment requirements.
-- **Submission & Completion Ring Queues**: Log writes prepare using `io_uring_prep_write` and submit directly to the kernel Submission Queue (SQ). Completions are reaped asynchronously from the Completion Queue (CQ) without blocking calling threads.
-
-```cpp
-// Direct I/O submission to io_uring ring
-struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-io_uring_prep_write(sqe, wal_fd_, aligned_buf, aligned_size, offset_);
-io_uring_sqe_set_data(sqe, req_metadata);
-io_uring_submit(&ring_); // Non-blocking kernel submission
-```
-
-### 2. Lock-Free SkipList MemTable with Atomic CAS
-- **Atomic Pointer Arrays**: SkipList nodes store atomic forward pointers (`std::atomic<Node*>`).
-- **Lock-Free CAS Insertions**: Insertions update pointers dynamically using atomic Compare-And-Swap (`compare_exchange_weak`), allowing multiple worker threads to insert entries concurrently without mutex locks.
-- **Thread-Safe Arena Bump-Allocator**: Memory for new nodes is allocated from pre-reserved 1MB memory blocks (`Arena`), eliminating dynamic `malloc` overhead and heap fragmentation.
-
-### 3. 64-Byte CPU Cache-Aligned Block Bloom Filters
-- **Cache Line Partitioning**: Standard Bloom filters scatter bit lookups across random memory addresses, causing up to 8 cache misses per query. Our filter partitions bits into 64-byte blocks matching exact CPU L1 cache line sizes.
-- **Single-Pass Double Hashing**: Computes FNV-1a and Murmur mix hashes in a single pass to map keys to a single 64-byte block, guaranteeing **at most 1 cache miss penalty**.
-
-### 4. Leveled Compaction & Automated Crash Recovery
-- **Leveled Compaction (L0 → L1)**: Merges overlapping Level 0 SSTables into non-overlapping Level 1 SSTables via single-pass multiway merge sort. Purges `DELETE` tombstones and obsolete keys in background execution.
-- **Automated WAL Crash Recovery**: On process restart, the engine scans the WAL file, validates CRC32 checksums, skips corrupted entries, and replays valid transactions into memory in **< 0.85ms**.
-
----
-
-## 🏗️ Architecture Design & Data Flow
+**Recovery.** On restart the engine replays the WAL, checks each record's CRC32, skips corrupted records, and rebuilds the MemTable.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Client
-    participant MemTable as Lock-Free SkipList MemTable (RAM)
-    participant WAL as io_uring WAL (O_DIRECT Disk)
-    participant Bloom as 64-Byte Cache-Aligned Bloom Filter
-    participant SST as Leveled SSTables (L0 -> L1 Disk)
+    participant WAL as WAL (io_uring + O_DIRECT)
+    participant Mem as SkipList MemTable
+    participant Bloom as Block Bloom filter
+    participant SST as SSTables (L0 → L1)
 
-    Note over Client, WAL: WRITE PATH (Zero Kernel Page-Cache Bottleneck)
-    Client->>WAL: Append entry via io_uring SQ (O_DIRECT DMA buffer)
-    WAL-->>Client: CQ Ring Completion notify (durability guaranteed)
-    Client->>MemTable: Insert key-value (Atomic CAS pointers + Memory Arena)
-    
-    Note over MemTable, SST: MEMTABLE FLUSH & LEVELED COMPACTION
-    alt MemTable Full (>16MB)
-        MemTable->>SST: Flush sorted run to L0 SSTable -> fsync -> clear WAL
+    Client->>WAL: Append record (aligned buffer, SQ submit)
+    WAL-->>Client: Completion reaped from CQ
+    Client->>Mem: Insert (CAS-linked nodes, Arena memory)
+    alt MemTable full (4 MiB default)
+        Mem->>SST: Flush sorted run to L0, clear WAL
     end
-    alt L0 SSTables >= 4
-        SST->>SST: Leveled Compaction sweep (Merge L0 -> L1, purge tombstones)
+    alt 4+ L0 tables
+        SST->>SST: Streaming k-way merge into L1, drop tombstones
     end
-
-    Note over Client, SST: READ PATH & CRASH RECOVERY
-    alt Process Restart / Crash Recovery
-        Client->>WAL: Replay log -> Verify CRC32 checksums -> Restore MemTable (<0.85ms)
-    end
-    Client->>MemTable: Traversal search O(log N)
-    alt Found in MemTable
-        MemTable-->>Client: Return active value
-    else Not in MemTable
-        Client->>Bloom: Probe 64-byte Block Bloom Filter (Max 1 Cache Line Miss)
-        alt Bloom Returns HIT
-            Client->>SST: Binary search Sparse Index (1 key per 64 entries) -> Read Block
-            SST-->>Client: Return active value (or Tombstone)
-        else Bloom Returns MISS
-            Bloom-->>Client: Fast-fail immediately (0 Disk I/O, 0.76μs latency)
+    Client->>Mem: Get(key)
+    alt Not in MemTable
+        Client->>Bloom: Probe one 64-byte block
+        alt Possibly present
+            Client->>SST: Sparse-index binary search, read block
+        else Definitely absent
+            Bloom-->>Client: Return not-found without disk I/O
         end
     end
 ```
 
----
-
-## 📊 Empirical Benchmarks
-
-Tested in a privileged Linux environment (Ubuntu 22.04, Kernel 6.12, NVMe SSD). Reproducible via [`benchmarks/bench_write.cpp`](benchmarks/bench_write.cpp) and [`benchmarks/bench_read.cpp`](benchmarks/bench_read.cpp) — full recorded run in [`benchmarks/results.md`](benchmarks/results.md).
-
-| Operation | Implementation | Throughput | Avg Latency | P99 Latency | Reliability & Safety |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Sequential Write** | **`io_uring` + `O_DIRECT`** | **254,095 ops/sec** | **3.85 μs** | **32.21 μs** | 0 Page-Cache Locks |
-| Sequential Write | Sync `write` + `fdatasync` | 2,525 ops/sec | 395.75 μs | 1,115.92 μs | High Flush Stalls |
-| **Point Read (Bloom HIT)** | **Sparse Index + Disk Seek** | **189,263 ops/sec** | **5.23 μs** | **13.50 μs** | 1 Disk I/O |
-| **Point Read (Bloom MISS)**| **64-Byte Block Bloom** | **1,315,789 ops/sec**| **0.76 μs** | **2.20 μs** | **≤ 1 Cache Miss (0 Disk I/O)** |
-| **WAL Crash Recovery** | **Log Replay & CRC Check** | **5,882,352 ops/sec**| **0.85 ms** / 5k keys | — | **CRC32 Integrity Verified** |
+Deeper design notes: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ---
 
-## 🧪 Systematic Test Suite
+## Benchmarks
+
+Recorded in a privileged Docker container (Ubuntu 22.04, kernel 6.12, NVMe SSD). Full output: [`benchmarks/results.md`](benchmarks/results.md).
+
+| Operation | Setup | Throughput | Avg | P99 |
+|---|---|---|---|---|
+| Sequential write | `io_uring` + `O_DIRECT` | 254,095 ops/s | 3.85 µs | 32.21 µs |
+| Sequential write | `write` + `fdatasync` per record | 2,525 ops/s | 395.75 µs | 1,115.92 µs |
+| Point read, Bloom hit | sparse index + block read | 189,263 ops/s | 5.23 µs | 13.50 µs |
+| Point read, Bloom miss | answered in memory | 1,315,789 ops/s | 0.76 µs | 2.20 µs |
+
+**Read these carefully.** The two write rows sit at different durability points. The `fdatasync` arm is on stable storage before each call returns. The `io_uring` arm reaches the device through `O_DIRECT` but is not forced to stable storage per record. So the gap between them measures the interface *and* the durability guarantee together, and it is not a like-for-like speedup. [`bench_write.cpp`](benchmarks/bench_write.cpp) also runs a third arm (buffered `write`, no sync) as a floor, and prints this caveat with its results.
 
 ```bash
-# Build test suite
-mkdir -p build && cd build && cmake .. && make -j$(nproc)
-
-# Run tests
-./test_skip_list      # Concurrent SkipList correctness & CAS thread safety
-./test_bloom_filter   # Cache-aligned Bloom Filter false-positive rates
-./test_wal_recovery   # Process crash simulation, WAL replay & CRC32 corruption validation
+./run_all.sh   # unit tests, then bench_write and bench_read
 ```
 
-To reproduce the benchmark table above rather than just the correctness tests, run `./run_all.sh` from the project root after building — it runs the unit tests followed by `bench_write` and `bench_read`.
-
 ---
 
-## 🚀 Quick Start (< 1 Minute)
+## Quick start
 
 ```bash
-# Clone repository
 git clone https://github.com/harsharajkumar-273/lsm_tree.git
 cd lsm_tree
 
-# Build and run unit tests & benchmarks in privileged Docker container
+# Build and run tests + benchmarks in Docker (io_uring needs --privileged)
 docker build -t lsm-engine .
 docker run --rm --privileged lsm-engine
+
+# Or build natively (Linux 5.1+, liburing)
+mkdir -p build && cd build && cmake .. && make -j"$(nproc)"
+./test_skip_list && ./test_bloom_filter && ./test_wal_recovery
 ```
+
+An interactive shell is in [`tools/lsm_cli.cpp`](tools/lsm_cli.cpp).
 
 ---
 
-## 📜 License
-Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for details.
+## Limitations
+
+- Single-node, single-process engine. No replication or snapshots.
+- Two levels (L0 → L1) only.
+- The `io_uring` write path is not forced to stable storage per record, so a power failure can lose recently acknowledged writes. See the benchmark note above.
+- Benchmarks were recorded on one machine. Your numbers will differ.
+
+---
+
+## Credits
+
+This engine was built in the open during the ELUSOC 2026 open-source program. [@harsharajkumar-273](https://github.com/harsharajkumar-273) started it and maintains it: architecture, issue triage, design review, and merging. Much of the current WAL, compaction, and test code comes from contributors:
+
+- [@SakethSumanBathini](https://github.com/SakethSumanBathini): WAL write ordering and offsets, fsync and write-failure handling, SkipList invariant tests, bounds and overflow fixes
+- [@Myparadox-creator](https://github.com/Myparadox-creator) (Aditya R. Satapathy): streaming k-way compaction with a priority-queue merge ([#100](https://github.com/harsharajkumar-273/lsm_tree/pull/100)), LRU block cache, and their tests
+- [@rohitkumarnaidu](https://github.com/rohitkumarnaidu) (Bappadala Rohith Kumar Naidu): features and fixes from the issue tracker
+
+See the [merged pull requests](https://github.com/harsharajkumar-273/lsm_tree/pulls?q=is%3Apr+is%3Amerged) for the full history.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
