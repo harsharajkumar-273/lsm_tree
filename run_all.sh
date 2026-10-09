@@ -16,16 +16,13 @@ echo "==========================================="
 echo "  LSM-Tree Key-Value Store — Test Runner  "
 echo "==========================================="
 
-echo "Running Unit Tests..."
-./build/test_skip_list
-./build/test_bloom_filter
-./build/test_wal_recovery
-./build/test_sstable
-./build/test_compaction_streaming
+echo "Running all registered tests (ctest)..."
+ctest --test-dir "$BUILD_DIR" --output-on-failure --timeout 300
 
 echo "Running Benchmarks..."
 "$BUILD_DIR/bench_write"
 "$BUILD_DIR/bench_read"
+"$BUILD_DIR/bench_durability" --quick
 
 echo "==========================================="
 echo "  All tests and benchmarks completed!      "

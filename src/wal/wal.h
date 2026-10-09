@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <liburing.h>
 
@@ -23,17 +25,66 @@ public:
         std::string value;
     };
 
-    explicit WAL(const std::string& path);
+    // What "the write call returned" promises. See DURABILITY.md.
+    //
+    //   Async   - returns once the record is *submitted* to io_uring. It may
+    //             still be in flight; it survives a process crash only if the
+    //             kernel completes it, and survives power loss only after a
+    //             later sync(). Errors surface on a later call or on sync().
+    //   Durable - returns once the record's write has completed AND fdatasync
+    //             has made it stable. Concurrent callers share one fdatasync
+    //             (group commit).
+    enum class Durability { Async, Durable };
+
+    // Names a position in the log. Valid until the next clear(); a ticket from
+    // an earlier epoch is treated as already satisfied, because clear() is only
+    // called after the entries it discards are durable in an SSTable.
+    struct Ticket {
+        uint64_t epoch = 0;
+        uint64_t end   = 0;   // log offset one past the record
+    };
+
+    explicit WAL(const std::string& path, Durability durability = Durability::Async);
     ~WAL();
 
+    // append*: submit the record and return. Never waits for durability, so a
+    // caller holding its own lock can release it before calling waitDurable().
+    Ticket appendPut(const std::string& key, const std::string& value);
+    Ticket appendDel(const std::string& key);
+
+    // Blocks until everything up to `t` is stable on disk. Throws if the log
+    // has recorded a write or sync failure.
+    void waitDurable(Ticket t);
+
+    // Makes every record appended so far durable (a barrier, valid in either mode).
+    void sync();
+
+    // append + (Durable mode only) waitDurable.
     void logPut(const std::string& key, const std::string& value);
     void logDel(const std::string& key);
+
+    Durability durability() const { return durability_; }
+
+    // Number of fdatasync calls issued. With group commit this is smaller than
+    // the number of durable appends whenever writers overlap.
+    uint64_t syncCount() const { return sync_calls_.load(); }
     std::vector<Entry> recover() const;
     void clear();
 
 private:
     int fd_;
     std::string path_;
+    Durability durability_;
+
+    // Group-commit state. Lock order: sync_mu_ before mu_, never the reverse.
+    // sync_mu_ is NOT held across fdatasync, so appends continue meanwhile and
+    // are picked up by the next leader.
+    std::mutex sync_mu_;
+    std::condition_variable sync_cv_;
+    bool sync_in_progress_ = false;
+    std::atomic<uint64_t> epoch_{0};   // bumped by clear() while holding sync_mu_ and mu_
+    std::atomic<uint64_t> sync_calls_{0};
+    uint64_t durable_end_ = 0;         // highest offset known stable in this epoch; guarded by sync_mu_
     struct io_uring ring_;
     // Tracks whether ring_ currently holds an initialised io_uring. Without it,
     // a clear() that fails partway leaves the destructor exiting a ring that
@@ -77,7 +128,7 @@ private:
 
     void recordFailure(const std::string& detail);
 
-    void writeEntry(Entry::Type type, const std::string& key, const std::string& value);
+    Ticket writeEntry(Entry::Type type, const std::string& key, const std::string& value);
     void reap();
     void drain();
     static uint32_t crc32(uint8_t type, const std::string& key, const std::string& value);
