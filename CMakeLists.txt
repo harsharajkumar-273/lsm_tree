@@ -66,6 +66,7 @@ if(NOT APPLE)
     lsm_add_test(test_durability_faults)
     lsm_add_test(test_crash_recovery)
     lsm_add_test(test_concurrent_durable)
+    lsm_add_test(test_wal_cancellation)
     set_tests_properties(test_crash_recovery PROPERTIES TIMEOUT 300)
 
     # Benchmark targets

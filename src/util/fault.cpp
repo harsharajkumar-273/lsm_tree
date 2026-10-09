@@ -12,6 +12,7 @@ namespace {
 struct Point {
     uint64_t hits = 0;
     uint64_t nth = 0;       // 0 = not armed
+    uint64_t repeat = 1;
     Action   action = Action::Throw;
 };
 std::mutex g_mu;
@@ -22,8 +23,8 @@ bool fires(const char* point, Action* out) {
     std::lock_guard<std::mutex> lock(g_mu);
     Point& p = g_points[point];
     ++p.hits;
-    if (p.nth != 0 && p.hits == p.nth) {
-        p.nth = 0;
+    if (p.nth != 0 && p.hits >= p.nth) {
+        if (p.hits >= p.nth + p.repeat - 1) p.nth = 0;   // last firing: disarm
         *out = p.action;
         return true;
     }
@@ -55,11 +56,12 @@ bool shouldFailSlow(const char* point) {
     return fires(point, &a) && a == Action::Fail;
 }
 
-void arm(const std::string& point, uint64_t nth, Action action) {
+void arm(const std::string& point, uint64_t nth, Action action, uint64_t repeat) {
     std::lock_guard<std::mutex> lock(g_mu);
     Point& p = g_points[point];
     p.hits = 0;
     p.nth = nth;
+    p.repeat = repeat ? repeat : 1;
     p.action = action;
     g_armed.store(true);
 }

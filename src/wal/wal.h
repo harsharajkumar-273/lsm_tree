@@ -18,6 +18,12 @@ public:
     // modest machine. Exceeding it throws rather than risking the OOM killer.
     static constexpr uint64_t MAX_RECOVERY_BYTES = 1ULL << 30;   // 1 GiB
 
+    // A request submitted from a thread that exits while it is in flight can be
+    // completed with -ECANCELED by the kernel, although nothing is wrong with the
+    // write. Retried this many times in total before it is reported as a permanent
+    // failure, so a persistently cancelling environment cannot loop forever.
+    static constexpr int kMaxWriteAttempts = 6;
+
     struct Entry {
         enum class Type { PUT = 0x01, DEL = 0x02 };
         Type        type;
@@ -68,6 +74,9 @@ public:
     // Number of fdatasync calls issued. With group commit this is smaller than
     // the number of durable appends whenever writers overlap.
     uint64_t syncCount() const { return sync_calls_.load(); }
+
+    // Writes resubmitted after an -ECANCELED completion (observability only).
+    uint64_t cancelRetries() const { return cancel_retries_.load(); }
     std::vector<Entry> recover() const;
     void clear();
 
@@ -84,6 +93,7 @@ private:
     bool sync_in_progress_ = false;
     std::atomic<uint64_t> epoch_{0};   // bumped by clear() while holding sync_mu_ and mu_
     std::atomic<uint64_t> sync_calls_{0};
+    std::atomic<uint64_t> cancel_retries_{0};
     uint64_t durable_end_ = 0;         // highest offset known stable in this epoch; guarded by sync_mu_
     struct io_uring ring_;
     // Tracks whether ring_ currently holds an initialised io_uring. Without it,
@@ -95,10 +105,22 @@ private:
     // Tagged on each SQE so the completion can be checked against what was
     // asked for. The buffer pointer alone was not enough to recognise a short
     // write, since the expected length was not recorded anywhere.
+    //
+    // offset and attempts exist so a request that completes with -ECANCELED can
+    // be resubmitted exactly as first issued: same buffer, same length, same file
+    // position. The buffer stays owned by this record until a completion that
+    // is final (success or permanent failure) is observed.
     struct PendingWrite {
-        void*  buf;
-        size_t bytes;
+        void*    buf;
+        size_t   bytes;
+        uint64_t offset;
+        int      attempts;   // submissions so far, including the first
     };
+
+    // Resubmits `p` after a cancellation. Returns 1 if it is in flight again, 0 if
+    // it could not be queued (caller still owns the buffer), -1 if the submit call
+    // itself failed (failure recorded; the buffer must be retained). Requires mu_.
+    int resubmit(PendingWrite* p);
 
     // First completion failure seen, retained rather than thrown. reap() runs
     // from the destructor, where throwing would terminate the process, so it

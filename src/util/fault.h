@@ -59,7 +59,8 @@ private:
 };
 
 // Test-side control.
-void arm(const std::string& point, uint64_t nth, Action action);
+// Fires on hits nth .. nth+repeat-1 (repeat > 1 models a persistent condition).
+void arm(const std::string& point, uint64_t nth, Action action, uint64_t repeat = 1);
 void disarmAll();
 uint64_t hitCount(const std::string& point);   // counted only while something is armed
 
