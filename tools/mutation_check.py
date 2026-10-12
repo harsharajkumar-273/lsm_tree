@@ -6,7 +6,7 @@ restores the file. A mutation is CAUGHT if at least one test fails, SURVIVED if
 the whole suite still passes. Exit status is non-zero if anything survives that
 is not listed in KNOWN_UNDETECTABLE.
 
-Usage: tools/mutation_check.py [build_dir] [name_filter]
+Usage: tools/mutation_check.py [build_dir] [name_filter]   (filter: substrings separated by "|")
 """
 import os, subprocess, sys
 
@@ -90,7 +90,7 @@ def main():
 
     survived = []
     for name, rel, old, new in MUTATIONS:
-        if FILTER and FILTER not in name: continue
+        if FILTER and not any(f in name for f in FILTER.split("|")): continue
         path = os.path.join(ROOT, rel)
         src = open(path).read()
         if src.count(old) != 1:
