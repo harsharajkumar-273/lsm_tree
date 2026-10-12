@@ -6,7 +6,7 @@ restores the file. A mutation is CAUGHT if at least one test fails, SURVIVED if
 the whole suite still passes. Exit status is non-zero if anything survives that
 is not listed in KNOWN_UNDETECTABLE.
 
-Usage: tools/mutation_check.py [build_dir] [name_filter]
+Usage: tools/mutation_check.py [build_dir] [name_filter]   (filter: substrings separated by "|")
 """
 import os, subprocess, sys
 
@@ -54,6 +54,15 @@ MUTATIONS = [
     ("fdatasync failure is ignored", "src/wal/wal_writer.cpp",
      "if (error.empty() && epoch_.load() == epoch) durable_end_",
      "error.clear();\n        if (error.empty() && epoch_.load() == epoch) durable_end_"),
+    ("-ECANCELED is not retried (treated as permanent failure)", "src/wal/wal_writer.cpp",
+     "if (pending->attempts < kMaxWriteAttempts) {", "if (false) {"),
+    ("-ECANCELED retries are unbounded", "src/wal/wal_writer.cpp",
+     "if (pending->attempts < kMaxWriteAttempts) {", "if (true) {"),
+    ("retry resubmits at offset 0 instead of the original offset", "src/wal/wal_writer.cpp",
+     "io_uring_prep_write(sqe, fd_, p->buf, p->bytes, p->offset);", "io_uring_prep_write(sqe, fd_, p->buf, p->bytes, 0);"),
+    ("cancelled attempt is counted as complete", "src/wal/wal_writer.cpp",
+     "continue;   // pending_cqes_ unchanged: one in flight before, one after",
+     "if (pending_cqes_ > 0) --pending_cqes_;\n                        continue;"),
     ("overwrite no longer replaces the value", "src/memtable/skip_list.h",
      "succs[0]->value.store(Node::makeSlot(arena_, value), std::memory_order_release);",
      ""),
@@ -81,7 +90,7 @@ def main():
 
     survived = []
     for name, rel, old, new in MUTATIONS:
-        if FILTER and FILTER not in name: continue
+        if FILTER and not any(f in name for f in FILTER.split("|")): continue
         path = os.path.join(ROOT, rel)
         src = open(path).read()
         if src.count(old) != 1:

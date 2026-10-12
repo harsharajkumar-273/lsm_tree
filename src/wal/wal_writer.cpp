@@ -273,13 +273,13 @@ WAL::Ticket WAL::writeEntry(Entry::Type type, const std::string& key, const std:
 
     // Carry the requested length alongside the buffer so the completion can be
     // compared against it.
-    auto* pending = new PendingWrite{ buf, aligned_size };
-
     // The offset is taken and advanced while mu_ is held, so two concurrent
     // writers cannot be handed the same position, and the record's location no
     // longer depends on which completion the kernel reaps first.
     const uint64_t offset = write_offset_;
     write_offset_ += aligned_size;
+
+    auto* pending = new PendingWrite{ buf, aligned_size, offset, 1 };
 
     io_uring_prep_write(sqe, fd_, buf, aligned_size, offset);
     io_uring_sqe_set_data(sqe, pending);
@@ -337,6 +337,25 @@ void WAL::recordFailure(const std::string& detail) {
     std::cerr << "[WAL] " << detail << std::endl;
 }
 
+int WAL::resubmit(PendingWrite* p) {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (!sqe) return 0;   // nothing queued, so the caller still owns the buffer
+    ++p->attempts;
+    io_uring_prep_write(sqe, fd_, p->buf, p->bytes, p->offset);
+    io_uring_sqe_set_data(sqe, p);
+    const int submitted = io_uring_submit(&ring_);
+    if (submitted < 0) {
+        // As in writeEntry(): a failed submit may leave the SQE queued with its
+        // address pointing at the buffer, so the buffer must not be freed. Leak it
+        // (and `p`) and detach the tag so reap() cannot touch either again.
+        io_uring_sqe_set_data(sqe, nullptr);
+        recordFailure(std::string("resubmitting cancelled write failed: ") + std::strerror(-submitted) +
+                      " (offset " + std::to_string(p->offset) + ")");
+        return -1;
+    }
+    return 1;
+}
+
 void WAL::reap() {
     struct io_uring_cqe* cqe;
     while (io_uring_peek_cqe(&ring_, &cqe) == 0) {
@@ -351,7 +370,33 @@ void WAL::reap() {
             int32_t res = cqe->res;
             if (fault::shouldFail("wal.cqe_error")) res = -EIO;
             if (fault::shouldFail("wal.short_write")) res = static_cast<int32_t>(pending->bytes / 2);
-            if (res < 0) {
+            if (fault::shouldFail("wal.cqe_cancel")) res = -ECANCELED;
+
+            // -ECANCELED means the kernel abandoned the request - typically because
+            // the thread that submitted it exited while it was in flight - not that
+            // the write failed. Nothing is known to have reached the log, so the
+            // record is NOT complete: it stays pending (pending_cqes_ is not
+            // decremented below, the buffer is not freed) and is submitted again at
+            // the same offset. Rewriting is idempotent, so a cancelled request that
+            // had in fact landed is harmless.
+            if (res == -ECANCELED) {
+                if (pending->attempts < kMaxWriteAttempts) {
+                    const int r = resubmit(pending);
+                    cancel_retries_.fetch_add(1);
+                    if (r == 1) {
+                        io_uring_cqe_seen(&ring_, cqe);
+                        continue;   // pending_cqes_ unchanged: one in flight before, one after
+                    }
+                    if (r < 0) {    // failure already recorded; buffer deliberately retained
+                        io_uring_cqe_seen(&ring_, cqe);
+                        if (pending_cqes_ > 0) --pending_cqes_;
+                        continue;
+                    }
+                }
+                recordFailure("write cancelled " + std::to_string(pending->attempts) +
+                              " time(s) and could not be completed (offset " +
+                              std::to_string(pending->offset) + ")");
+            } else if (res < 0) {
                 recordFailure(std::string("write failed: ") + std::strerror(-res));
             } else if (static_cast<size_t>(res) < pending->bytes) {
                 recordFailure("short write: " + std::to_string(res) + " of "

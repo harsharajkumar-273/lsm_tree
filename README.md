@@ -10,7 +10,7 @@ A C++17 log-structured merge-tree key-value engine for Linux: an `io_uring` + `O
 | | |
 |---|---|
 | **Write path** | `io_uring` + `O_DIRECT` WAL with two acknowledgment modes: `Async` (returns on submission) and `Durable` (returns after `fdatasync`, with group commit). Measured on one VM: ~100k acks/s but ~8k completed-and-synced ops/s in `Async`; 4–6k durable ops/s with 8 writers in `Durable`. See [Benchmarks](#benchmarks) |
-| **Correctness** | 13 CTest programs run in CI: randomized put/get/delete vs a reference map, SIGKILL crash recovery at 20 injected fault points, fault injection around WAL writes / flush / compaction, torn and bit-flipped logs, SkipList invariants. A mutation check plants 15 known bugs and requires the suite to catch each (one, a skipped `fdatasync`, is invisible to process-crash tests and is documented as such) |
+| **Correctness** | 14 CTest programs run in CI: randomized put/get/delete vs a reference map, SIGKILL crash recovery at 20 injected fault points, `-ECANCELED` handling when submitting threads exit, fault injection around WAL writes / flush / compaction, torn and bit-flipped logs, SkipList invariants. A mutation check plants 19 known bugs and requires the suite to catch each (one, a skipped `fdatasync`, is invisible to process-crash tests and is documented as such) |
 | **Contract** | [`DURABILITY.md`](DURABILITY.md) states exactly what a returned `put()` guarantees and which failure models are tested |
 | **Built by** | Started by [@harsharajkumar-273](https://github.com/harsharajkumar-273); developed with contributors during ELUSOC 2026 (see [Credits](#credits)) |
 

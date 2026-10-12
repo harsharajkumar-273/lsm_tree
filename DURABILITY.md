@@ -62,11 +62,43 @@ Enforced by `test_crash_recovery` (same scenarios, exact prefix comparison) and
 `test_concurrent_durable` (8 writers, SIGKILL at random times, every
 acknowledged write must be present).
 
+**Acknowledgment is conditional on a final, successful completion.** A `Durable`
+call returns only after (1) the record's write produced a successful completion
+and (2) an `fdatasync` that started after that completion finished. A write that
+fails permanently, or an `fdatasync` that fails, makes the call throw; it is never
+acknowledged (`test_wal_cancellation`, `test_durability_faults`). An `Async` call
+promises none of this: it returns once the request is *submitted*, so the
+completion, retry and sync described below can all still be ahead of it.
+
 **Group commit.** The engine lock is released before waiting for `fdatasync`;
 the first waiter becomes leader, drains completions, and issues one `fdatasync`
 that covers every record appended so far. Concurrent writers share it
 (`LSMEngine::walSyncCount()` exposes the count). A write is visible to readers
 slightly before it is durable; the *caller* is not told it succeeded until it is.
+
+## Cancelled writes (`-ECANCELED`)
+
+`io_uring` completes a request with `-ECANCELED` when the thread that submitted it
+exits while the request is in flight (seen on tmpfs; ext4 usually completes the
+write inline). The write did not fail, it was abandoned, so:
+
+- The record is **not complete**. Its completion is not counted, its buffer is not
+  freed, and no durability bookkeeping advances. The write is resubmitted with the
+  original buffer, length and file offset. Rewriting the same bytes at the same
+  offset is idempotent, so a cancelled request that had in fact landed is harmless.
+- Retries are bounded: `WAL::kMaxWriteAttempts` (6) submissions in total per record.
+  After that, or if resubmission itself fails, the WAL records a permanent failure
+  ("write cancelled N time(s) and could not be completed"), refuses further appends,
+  and reports it from `sync()` / the next append / a `Durable` call.
+- Retries run on whichever thread next reaps completions (`put`, `sync`, `clear`,
+  destruction). In `Async` mode a cancelled record therefore stays *unwritten*
+  until some later WAL call reaps it; a crash in that window loses it, which is
+  within the `Async` contract (records after the last `sync()` may be lost). A
+  `Durable` call and `sync()` wait for the retry.
+
+Covered by `test_wal_cancellation`: deterministic injection (`wal.cqe_cancel`),
+and real submitter-thread exit on the default temp filesystem and on tmpfs
+(`/dev/shm`, when it supports `O_DIRECT`), checking every record and value.
 
 ## Flush, compaction and recovery invariants
 
