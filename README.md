@@ -9,21 +9,22 @@ A C++17 log-structured merge-tree key-value engine for Linux: an `io_uring` + `O
 
 | | |
 |---|---|
-| **Write path** | 254,095 writes/sec, 3.85 µs avg, 32.21 µs P99 (`io_uring` + `O_DIRECT`, not fsynced per record) |
-| **Read path** | 189,263 reads/sec on Bloom hits; 1,315,789 reads/sec on Bloom misses (0.76 µs avg, no disk access) |
-| **Tests** | 8 test programs: SkipList (incl. invariants), Bloom filter, WAL ordering and crash recovery, SSTable, block cache, streaming compaction |
+| **Write path** | `io_uring` + `O_DIRECT` WAL with two acknowledgment modes: `Async` (returns on submission) and `Durable` (returns after `fdatasync`, with group commit). Measured on one VM: ~100k acks/s but ~8k completed-and-synced ops/s in `Async`; 4–6k durable ops/s with 8 writers in `Durable`. See [Benchmarks](#benchmarks) |
+| **Correctness** | 14 CTest programs run in CI: randomized put/get/delete vs a reference map, SIGKILL crash recovery at 20 injected fault points, `-ECANCELED` handling when submitting threads exit, fault injection around WAL writes / flush / compaction, torn and bit-flipped logs, SkipList invariants. A mutation check plants 19 known bugs and requires the suite to catch each (one, a skipped `fdatasync`, is invisible to process-crash tests and is documented as such) |
+| **Contract** | [`DURABILITY.md`](DURABILITY.md) states exactly what a returned `put()` guarantees and which failure models are tested |
 | **Built by** | Started by [@harsharajkumar-273](https://github.com/harsharajkumar-273); developed with contributors during ELUSOC 2026 (see [Credits](#credits)) |
 
-All numbers come from [`benchmarks/results.md`](benchmarks/results.md) and can be reproduced with `./run_all.sh`.
+Benchmark numbers are in [`benchmarks/results.md`](benchmarks/results.md) with hardware, repetitions and raw data, and reproduce with `./build/bench_durability`.
 
 ---
 
 ## How it works
 
-**Write path.** Every `PUT`/`DELETE` is appended to the WAL, then inserted into the MemTable.
+**Write path.** Every `PUT`/`DELETE` is appended to the WAL, then inserted into the MemTable. What "appended" means when the call returns depends on the durability mode in [`DURABILITY.md`](DURABILITY.md).
 
 - The WAL file is opened with `O_DIRECT`, so writes skip the page cache. Buffers are 512-byte aligned (`posix_memalign`) as `O_DIRECT` requires.
-- Appends are submitted through an `io_uring` submission queue and reaped from the completion queue, so callers don't block on each write. A mutex serializes submission so log order matches write order.
+- Appends are submitted through an `io_uring` submission queue and reaped from the completion queue. A mutex serializes submission and assigns each record its file offset, so log order matches write order even though completions arrive out of order.
+- `Durable` mode additionally waits for the write to complete and for an `fdatasync`, outside the engine lock so concurrent writers share one `fdatasync` (group commit). `sync()` gives `Async` users an explicit barrier.
 - The MemTable is a SkipList with atomic forward pointers. Inserts link nodes with compare-and-swap, so traversals never take a lock. Nodes come from a bump-pointer `Arena` in 1 MB chunks.
 
 **Flush and compaction.** When the MemTable passes its size limit (4 MiB by default) it is flushed to a sorted Level-0 SSTable and the WAL is cleared. Once there are 4 L0 tables, leveled compaction merges them into non-overlapping L1 tables with a streaming k-way merge (bounded memory) and drops tombstones.
@@ -67,19 +68,24 @@ Deeper design notes: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Benchmarks
 
-Recorded in a privileged Docker container (Ubuntu 22.04, kernel 6.12, NVMe SSD). Full output: [`benchmarks/results.md`](benchmarks/results.md).
+Measured on a 4-vCPU Xeon VM, ext4 on a virtual disk, kernel 6.18, 10,000 operations per run, median of 5 runs. Full tables for four record sizes and 1 vs 8 writers, raw data and caveats: [`benchmarks/results.md`](benchmarks/results.md).
 
-| Operation | Setup | Throughput | Avg | P99 |
-|---|---|---|---|---|
-| Sequential write | `io_uring` + `O_DIRECT` | 254,095 ops/s | 3.85 µs | 32.21 µs |
-| Sequential write | `write` + `fdatasync` per record | 2,525 ops/s | 395.75 µs | 1,115.92 µs |
-| Point read, Bloom hit | sparse index + block read | 189,263 ops/s | 5.23 µs | 13.50 µs |
-| Point read, Bloom miss | answered in memory | 1,315,789 ops/s | 0.76 µs | 2.20 µs |
+Every row below is a **16-byte-value, one-writer** run; the point is how far apart *acknowledged* and *completed-and-durable* are:
 
-**Read these carefully.** The two write rows sit at different durability points. The `fdatasync` arm is on stable storage before each call returns. The `io_uring` arm reaches the device through `O_DIRECT` but is not forced to stable storage per record. So the gap between them measures the interface *and* the durability guarantee together, and it is not a like-for-like speedup. [`bench_write.cpp`](benchmarks/bench_write.cpp) also runs a third arm (buffered `write`, no sync) as a floor, and prints this caveat with its results.
+| Implementation | `put()` returns when | Ack throughput | Drain to durable | **Durable throughput** |
+|---|---|---:|---:|---:|
+| `io_uring` + `O_DIRECT` WAL (`Async`) | submitted | 124,854 ops/s | 1,144 ms | **8,226 ops/s** |
+| buffered `write()` + one final `fdatasync` | in page cache | 783,207 ops/s | 2 ms | **664,181 ops/s** |
+| `io_uring` + `O_DIRECT` WAL (`Durable`) | write done + `fdatasync` | 1,819 ops/s | 0 | **1,819 ops/s** |
+| `write()` + `fdatasync` per record | durable | 2,629 ops/s | 0 | **2,628 ops/s** |
+
+With 8 concurrent writers, `Durable` group commit reaches 5.9k ops/s against 3.8k for per-record `fdatasync` (4.2k vs 1.8k at 4 KB values). It is slower than a plain `fdatasync` with a single writer, and the `io_uring` WAL is not faster than buffered I/O at any matched durability level on this hardware. The 254,095 writes/s figure that used to appear here was a submission rate: `bench_write` stopped its clock before the destructor drained the ring, and on this machine that drain is about a second per 10,000 records.
 
 ```bash
-./run_all.sh   # unit tests, then bench_write and bench_read
+cmake -B build && cmake --build build -j
+./build/bench_durability        # ~15 min; add --quick for a smoke run
+ctest --test-dir build          # all correctness tests
+python3 tools/mutation_check.py # plants bugs, expects test failures (~30 min)
 ```
 
 ---
@@ -95,8 +101,8 @@ docker build -t lsm-engine .
 docker run --rm --privileged lsm-engine
 
 # Or build natively (Linux 5.1+, liburing)
-mkdir -p build && cd build && cmake .. && make -j"$(nproc)"
-./test_skip_list && ./test_bloom_filter && ./test_wal_recovery
+cmake -B build && cmake --build build -j"$(nproc)"
+ctest --test-dir build --output-on-failure
 ```
 
 An interactive shell is in [`tools/lsm_cli.cpp`](tools/lsm_cli.cpp).
@@ -107,8 +113,9 @@ An interactive shell is in [`tools/lsm_cli.cpp`](tools/lsm_cli.cpp).
 
 - Single-node, single-process engine. No replication or snapshots.
 - Two levels (L0 → L1) only.
-- The `io_uring` write path is not forced to stable storage per record, so a power failure can lose recently acknowledged writes. See the benchmark note above.
-- Benchmarks were recorded on one machine. Your numbers will differ.
+- In the default `Async` mode a returned `put()` is not durable: it can be lost on a process crash (if still in flight) and on power loss (until `sync()`). Use `WAL::Durability::Durable` for per-write durability. Power-loss behaviour is not tested; see [`DURABILITY.md`](DURABILITY.md#not-covered).
+- `O_DIRECT` pads every WAL record to 512 bytes (16x write amplification for small values).
+- Benchmarks were recorded on one virtualised machine. Your numbers will differ.
 
 ---
 

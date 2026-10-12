@@ -1,4 +1,5 @@
 #include "lsm_engine.h"
+#include "../util/fault.h"
 #include <filesystem>
 #include <limits>
 #include <algorithm>
@@ -16,11 +17,11 @@ struct SSTFile {
     int counter;
 };
 
-LSMEngine::LSMEngine(const std::string& data_dir, size_t memtable_max_bytes)
+LSMEngine::LSMEngine(const std::string& data_dir, size_t memtable_max_bytes, WAL::Durability durability)
     : data_dir_(data_dir)
     , memtable_max_bytes_(memtable_max_bytes)
     , lock_fd_(acquireDirectoryLock(ensureDir(data_dir)))
-    , wal_(data_dir + "/wal.log")
+    , wal_(data_dir + "/wal.log", durability)
     , memtable_(std::make_unique<Memtable>(memtable_max_bytes))
     , compactor_(data_dir)
 {
@@ -71,22 +72,39 @@ std::string LSMEngine::ensureDir(const std::string& dir) {
     return dir;
 }
 
+// In Durable mode the wait for fdatasync happens *after* mu_ is released.
+// Holding the engine lock across a device flush would serialise every writer
+// behind it and make group commit impossible: only one record could ever be
+// waiting. Visibility to readers therefore precedes durability, as in most
+// engines; the caller is not told the write succeeded until it is durable.
 void LSMEngine::put(const std::string& key, const std::string& value) {
-    std::unique_lock<std::shared_mutex> lock(mu_);
-    wal_.logPut(key, value);
-    memtable_->put(key, value);
-    if (memtable_->isFull()) {
-        flushMemtable();
+    WAL::Ticket ticket;
+    {
+        std::unique_lock<std::shared_mutex> lock(mu_);
+        ticket = wal_.appendPut(key, value);
+        memtable_->put(key, value);
+        if (memtable_->isFull()) {
+            flushMemtable();
+        }
     }
+    if (wal_.durability() == WAL::Durability::Durable) wal_.waitDurable(ticket);
 }
 
 void LSMEngine::del(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lock(mu_);
-    wal_.logDel(key);
-    memtable_->del(key);
-    if (memtable_->isFull()) {
-        flushMemtable();
+    WAL::Ticket ticket;
+    {
+        std::unique_lock<std::shared_mutex> lock(mu_);
+        ticket = wal_.appendDel(key);
+        memtable_->del(key);
+        if (memtable_->isFull()) {
+            flushMemtable();
+        }
     }
+    if (wal_.durability() == WAL::Durability::Durable) wal_.waitDurable(ticket);
+}
+
+void LSMEngine::sync() {
+    wal_.sync();
 }
 
 std::optional<std::string> LSMEngine::get(const std::string& key) const {
@@ -125,9 +143,11 @@ void LSMEngine::flushMemtable() {
     }
 
     // Level 0 files get sst-0-xxxxxx.sst path
+    fault::hit("flush.before_sst");
     std::string path = sstPath(0, sst_counter_++);
     SSTable::write(path, entries);
     sstables_.push_back(std::make_unique<SSTable>(path));
+    fault::hit("flush.after_sst");   // table durable, WAL still holds the same entries
 
     // Build the replacement memtable before discarding the log.
     //
@@ -144,6 +164,7 @@ void LSMEngine::flushMemtable() {
     auto replacement = std::make_unique<Memtable>(memtable_max_bytes_);
     wal_.clear();
     memtable_ = std::move(replacement);
+    fault::hit("flush.after_wal_clear");
 
     // Run leveled compaction if necessary
     compactor_.run(sstables_, sst_counter_);

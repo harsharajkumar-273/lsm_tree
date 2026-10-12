@@ -7,11 +7,12 @@ This document details the low-level systems design and architecture of this high
 ## 1. The Write Path
 
 ### Write-Ahead Log (WAL) with `io_uring`
-To guarantee durability before returning a successful write to the client, every insertion (`PUT` or `DELETE`) is appended to a Write-Ahead Log. Standard synchronous file writes block the calling thread, stalling writes. This engine utilizes Linux's next-generation asynchronous I/O interface, **`io_uring`**, combined with **`O_DIRECT`**:
+Every insertion (`PUT` or `DELETE`) is appended to a Write-Ahead Log before it is applied to the memtable. What a returned write promises (submitted vs `fdatasync`ed) depends on the mode chosen; see [`DURABILITY.md`](DURABILITY.md). Standard synchronous file writes block the calling thread, stalling writes. This engine utilizes Linux's next-generation asynchronous I/O interface, **`io_uring`**, combined with **`O_DIRECT`**:
 - **Zero-Copy & Direct I/O**: File descriptors are opened with the `O_DIRECT` flag, bypassing the OS page cache entirely. Writes copy bytes directly from user-space memory buffers to physical disk blocks.
 - **Buffer Alignment**: `O_DIRECT` requires that buffers, memory offsets, and file offsets be aligned to the block size (512 bytes). Writes are rounded up to 512-byte multiples, allocating page-aligned buffers via `posix_memalign`.
 - **io_uring Submission**: A write request is prepared using `io_uring_prep_write` and submitted to the Submission Queue (SQ).
-- **Concurrency & Serialization**: While queue completions are reaped asynchronously, concurrent threads submit requests sequentially via a mutex lock to guarantee that log entries are appended in chronological order.
+- **Concurrency & Serialization**: While queue completions are reaped asynchronously, concurrent threads submit requests sequentially via a mutex lock, and each record is assigned its file offset under that lock, so log order is fixed at submission regardless of completion order.
+- **Group commit (`Durable` mode)**: the engine lock is released before waiting for durability. The first waiter drains completions and runs one `fdatasync` covering every record appended so far; other waiters whose records are covered return without syncing.
 
 ### Concurrent MemTable (SkipList)
 Once logged, the key-value pair is inserted into the memory table (MemTable), which is built on a concurrent lock-free **SkipList**:

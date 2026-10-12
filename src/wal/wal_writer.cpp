@@ -1,4 +1,5 @@
 #include "wal.h"
+#include "../util/fault.h"
 #include <stdexcept>
 #include <fcntl.h>
 #include <unistd.h>
@@ -7,8 +8,10 @@
 #include <limits>
 #include <iostream>
 #include <filesystem>
+#include <algorithm>
+#include <cerrno>
 
-WAL::WAL(const std::string& path) : path_(path) {
+WAL::WAL(const std::string& path, Durability durability) : path_(path), durability_(durability) {
     // O_APPEND is deliberately gone.
     //
     // With an explicit offset on every write, O_APPEND would override it — the
@@ -50,16 +53,98 @@ WAL::~WAL() {
     if (fd_ >= 0) close(fd_);
 }
 
+WAL::Ticket WAL::appendPut(const std::string& key, const std::string& value) {
+    return writeEntry(Entry::Type::PUT, key, value);
+}
+
+WAL::Ticket WAL::appendDel(const std::string& key) {
+    return writeEntry(Entry::Type::DEL, key, "");
+}
+
 void WAL::logPut(const std::string& key, const std::string& value) {
-    writeEntry(Entry::Type::PUT, key, value);
+    Ticket t = appendPut(key, value);
+    if (durability_ == Durability::Durable) waitDurable(t);
 }
 
 void WAL::logDel(const std::string& key) {
-    writeEntry(Entry::Type::DEL, key, "");
+    Ticket t = appendDel(key);
+    if (durability_ == Durability::Durable) waitDurable(t);
+}
+
+void WAL::sync() {
+    Ticket t;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        t.end = write_offset_;
+        t.epoch = epoch_.load();
+    }
+    waitDurable(t);
+}
+
+// Group commit. The first waiter that finds no sync running becomes the leader:
+// it drains completions (so every write submitted so far has actually landed),
+// notes how far the log extends, and runs one fdatasync covering all of it.
+// Waiters whose record is within that range return without syncing again.
+void WAL::waitDurable(Ticket t) {
+    std::unique_lock<std::mutex> lock(sync_mu_);
+    while (true) {
+        if (t.epoch != epoch_.load()) return;    // flushed to an SSTable since
+        if (durable_end_ >= t.end) return;
+        if (sync_in_progress_) {
+            sync_cv_.wait(lock);
+            continue;
+        }
+
+        sync_in_progress_ = true;
+        const uint64_t epoch = epoch_.load();
+        lock.unlock();
+
+        uint64_t target = 0;
+        std::string error;
+        try {
+            int fd;
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                drain();
+                if (!failure_.empty()) error = failure_;
+                target = write_offset_;
+                fd = fd_;
+            }
+            if (error.empty()) {
+                fault::hit("wal.before_fdatasync");
+                // clear() waits for sync_in_progress_ to drop before it closes
+                // fd_, so the descriptor stays valid for the whole call.
+                sync_calls_.fetch_add(1);
+                if (fault::shouldFail("wal.fdatasync_error") || ::fdatasync(fd) != 0) {
+                    error = std::string("fdatasync failed: ") + std::strerror(errno);
+                }
+                if (error.empty()) fault::hit("wal.after_fdatasync");
+            }
+        } catch (...) {
+            lock.lock();
+            sync_in_progress_ = false;
+            sync_cv_.notify_all();
+            throw;
+        }
+
+        lock.lock();
+        sync_in_progress_ = false;
+        if (error.empty() && epoch_.load() == epoch) durable_end_ = std::max(durable_end_, target);
+        sync_cv_.notify_all();
+        if (!error.empty()) throw std::runtime_error("WAL: " + error);
+    }
 }
 
 void WAL::clear() {
+    // Wait out any group-commit leader: it is using fd_ without holding mu_.
+    // Holding sync_mu_ for the rest of the call also stops a new leader starting.
+    std::unique_lock<std::mutex> sync_lock(sync_mu_);
+    sync_cv_.wait(sync_lock, [&] { return !sync_in_progress_; });
+    durable_end_ = 0;
+
     std::lock_guard<std::mutex> lock(mu_);
+    epoch_.fetch_add(1);
+    sync_cv_.notify_all();
     drain();                     // drain all pending in-flight CQEs synchronously
 
     // Every handle is marked released as it is released, and the removal uses
@@ -99,9 +184,16 @@ void WAL::clear() {
     }
     ring_ready_ = true;
     pending_cqes_ = 0;
+
+    // The log that failed no longer exists. clear() is only called once the
+    // entries it held are durable in an SSTable, so the "log has a hole"
+    // condition recorded in failure_ describes a file that is now gone.
+    // Keeping it would leave the engine refusing every write forever after a
+    // single transient error, even though the next log starts clean.
+    failure_.clear();
 }
 
-void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string& value) {
+WAL::Ticket WAL::writeEntry(Entry::Type type, const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> lock(mu_);
 
     // A completion has already reported a failed or short write, so the log on
@@ -127,6 +219,8 @@ void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string
             "length field (key=" + std::to_string(key.size()) +
             ", value=" + std::to_string(value.size()) + ")");
     }
+
+    fault::hit("wal.before_append");
 
     // Allocate 4096-aligned buffer for O_DIRECT
     size_t size = 1 + 4 + 4 + key.size() + value.size() + 4;
@@ -179,13 +273,13 @@ void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string
 
     // Carry the requested length alongside the buffer so the completion can be
     // compared against it.
-    auto* pending = new PendingWrite{ buf, aligned_size };
-
     // The offset is taken and advanced while mu_ is held, so two concurrent
     // writers cannot be handed the same position, and the record's location no
     // longer depends on which completion the kernel reaps first.
     const uint64_t offset = write_offset_;
     write_offset_ += aligned_size;
+
+    auto* pending = new PendingWrite{ buf, aligned_size, offset, 1 };
 
     io_uring_prep_write(sqe, fd_, buf, aligned_size, offset);
     io_uring_sqe_set_data(sqe, pending);
@@ -224,6 +318,14 @@ void WAL::writeEntry(Entry::Type type, const std::string& key, const std::string
 
     // Reap any completed CQEs (non-blocking) to free buffers promptly
     reap();
+
+    // epoch_ only changes inside clear() while mu_ is held, so this offset and
+    // epoch describe the same log.
+    Ticket ticket;
+    ticket.end = write_offset_;
+    ticket.epoch = epoch_.load();
+    fault::hit("wal.after_append");
+    return ticket;
 }
 
 void WAL::recordFailure(const std::string& detail) {
@@ -233,6 +335,25 @@ void WAL::recordFailure(const std::string& detail) {
         failure_ = detail;
     }
     std::cerr << "[WAL] " << detail << std::endl;
+}
+
+int WAL::resubmit(PendingWrite* p) {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    if (!sqe) return 0;   // nothing queued, so the caller still owns the buffer
+    ++p->attempts;
+    io_uring_prep_write(sqe, fd_, p->buf, p->bytes, p->offset);
+    io_uring_sqe_set_data(sqe, p);
+    const int submitted = io_uring_submit(&ring_);
+    if (submitted < 0) {
+        // As in writeEntry(): a failed submit may leave the SQE queued with its
+        // address pointing at the buffer, so the buffer must not be freed. Leak it
+        // (and `p`) and detach the tag so reap() cannot touch either again.
+        io_uring_sqe_set_data(sqe, nullptr);
+        recordFailure(std::string("resubmitting cancelled write failed: ") + std::strerror(-submitted) +
+                      " (offset " + std::to_string(p->offset) + ")");
+        return -1;
+    }
+    return 1;
 }
 
 void WAL::reap() {
@@ -246,10 +367,39 @@ void WAL::reap() {
         // requested length means the record on disk is truncated. Either way the
         // caller has been told the entry is recoverable when it is not.
         if (pending) {
-            if (cqe->res < 0) {
-                recordFailure(std::string("write failed: ") + std::strerror(-cqe->res));
-            } else if (static_cast<size_t>(cqe->res) < pending->bytes) {
-                recordFailure("short write: " + std::to_string(cqe->res) + " of "
+            int32_t res = cqe->res;
+            if (fault::shouldFail("wal.cqe_error")) res = -EIO;
+            if (fault::shouldFail("wal.short_write")) res = static_cast<int32_t>(pending->bytes / 2);
+            if (fault::shouldFail("wal.cqe_cancel")) res = -ECANCELED;
+
+            // -ECANCELED means the kernel abandoned the request - typically because
+            // the thread that submitted it exited while it was in flight - not that
+            // the write failed. Nothing is known to have reached the log, so the
+            // record is NOT complete: it stays pending (pending_cqes_ is not
+            // decremented below, the buffer is not freed) and is submitted again at
+            // the same offset. Rewriting is idempotent, so a cancelled request that
+            // had in fact landed is harmless.
+            if (res == -ECANCELED) {
+                if (pending->attempts < kMaxWriteAttempts) {
+                    const int r = resubmit(pending);
+                    cancel_retries_.fetch_add(1);
+                    if (r == 1) {
+                        io_uring_cqe_seen(&ring_, cqe);
+                        continue;   // pending_cqes_ unchanged: one in flight before, one after
+                    }
+                    if (r < 0) {    // failure already recorded; buffer deliberately retained
+                        io_uring_cqe_seen(&ring_, cqe);
+                        if (pending_cqes_ > 0) --pending_cqes_;
+                        continue;
+                    }
+                }
+                recordFailure("write cancelled " + std::to_string(pending->attempts) +
+                              " time(s) and could not be completed (offset " +
+                              std::to_string(pending->offset) + ")");
+            } else if (res < 0) {
+                recordFailure(std::string("write failed: ") + std::strerror(-res));
+            } else if (static_cast<size_t>(res) < pending->bytes) {
+                recordFailure("short write: " + std::to_string(res) + " of "
                               + std::to_string(pending->bytes) + " bytes reached the log");
             }
 

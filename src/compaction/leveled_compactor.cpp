@@ -1,4 +1,5 @@
 #include "leveled_compactor.h"
+#include "../util/fault.h"
 #include <map>
 #include <filesystem>
 #include <sstream>
@@ -96,6 +97,21 @@ void LeveledCompactor::run(std::vector<std::unique_ptr<SSTable>>& sstables, int&
         }
     }
 
+    // Orphans from an interrupted publish are not in `sstables`, so numbering
+    // from the in-memory list alone could collide with them (and leave the ones
+    // not overwritten shadowing newer data on the next start). Number past
+    // everything on disk.
+    {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(data_dir_, ec)) {
+            const std::string stem = entry.path().stem().string();
+            if (entry.path().extension() != ".sst" || stem.rfind("sst-1-", 0) != 0) continue;
+            try {
+                l1_start = std::max(l1_start, std::stoi(stem.substr(6)) + 1);
+            } catch (const std::exception&) {}
+        }
+    }
+
     // Phase 1 - Streaming K-Way merge using Min-Heap
     std::vector<std::pair<std::string, std::string>> staged; // temporary -> final
     int l1_counter = l1_start;
@@ -153,6 +169,7 @@ void LeveledCompactor::run(std::vector<std::unique_ptr<SSTable>>& sstables, int&
         }
 
         flushBuffer();
+        fault::hit("compact.after_merge");   // outputs staged as .tmp, nothing published
     } catch (...) {
         for (const auto& [tmp, fin] : staged) {
             // Also best effort, and deliberately silent: this runs during
@@ -166,10 +183,43 @@ void LeveledCompactor::run(std::vector<std::unique_ptr<SSTable>>& sstables, int&
 
     // Phase 2 - publish. Each rename is atomic, so a table is either absent or
     // present and complete; it is never observed half-written.
-    for (const auto& [tmp, fin] : staged) {
-        std::filesystem::rename(tmp, fin);
+    //
+    // An exception part-way through (injected or a real rename failure) must
+    // not leave the already-renamed outputs behind. The in-memory table list
+    // still describes the pre-compaction state, so those files would sit on disk
+    // as extra L1 tables that the next start loads *after* the old L1 and the
+    // eventual compaction output - letting stale values shadow newer ones. Undo
+    // the renames that happened and drop the rest of the staged temporaries.
+    // (A hard crash cannot run this, but is safe for a different reason: the
+    // outputs hold exactly the merged winners of the inputs, and the inputs are
+    // removed oldest-first - L1 before L0 - so a tombstone is never deleted while
+    // an older value it shadows survives. See DURABILITY.md.)
+    size_t published = 0;
+    std::vector<std::unique_ptr<SSTable>> fresh;
+    try {
+        for (const auto& [tmp, fin] : staged) {
+            std::filesystem::rename(tmp, fin);
+            ++published;
+            fault::hit("compact.mid_publish");
+        }
+        fsyncDir(data_dir_);
+
+        // Open the replacements now, while the inputs are still on disk and the
+        // compaction can still be abandoned. Opening them after the inputs are
+        // removed meant an open failure left the engine with no tables at all.
+        fresh.reserve(staged.size());
+        for (const auto& [tmp, fin] : staged) {
+            fresh.push_back(std::make_unique<SSTable>(fin));
+        }
+        fault::hit("compact.after_publish");   // outputs live, inputs still present
+    } catch (...) {
+        fresh.clear();
+        std::error_code ec;
+        for (size_t i = 0; i < staged.size(); ++i) {
+            std::filesystem::remove(i < published ? staged[i].second : staged[i].first, ec);
+        }
+        throw;
     }
-    fsyncDir(data_dir_);
 
     // Phase 3 - only now are the inputs expendable; their contents are durable
     // under the new names.
@@ -188,6 +238,7 @@ void LeveledCompactor::run(std::vector<std::unique_ptr<SSTable>>& sstables, int&
     // damage is deferred to the next restart, and an operator who sees this can
     // remove the file before that happens.
     for (const auto& sst : sstables) {
+        fault::crashPoint("compact.mid_remove");
         std::error_code ec;
         std::filesystem::remove(sst->path(), ec);
         if (ec) {
@@ -197,11 +248,9 @@ void LeveledCompactor::run(std::vector<std::unique_ptr<SSTable>>& sstables, int&
         }
     }
     fsyncDir(data_dir_);
+    fault::crashPoint("compact.after_remove");
 
-    sstables.clear();
-    for (const auto& [tmp, fin] : staged) {
-        sstables.push_back(std::make_unique<SSTable>(fin));
-    }
+    sstables = std::move(fresh);
 
     std::cout << "[Compaction] Compaction finished. " << staged.size() << " Level 1 tables written.\n";
     sst_counter = 0; // Reset L0 counter for subsequent flushes

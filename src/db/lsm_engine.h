@@ -11,7 +11,9 @@
 
 class LSMEngine {
 public:
-    explicit LSMEngine(const std::string& data_dir, size_t memtable_max_bytes = Memtable::DEFAULT_MAX_BYTES);
+    explicit LSMEngine(const std::string& data_dir,
+                       size_t memtable_max_bytes = Memtable::DEFAULT_MAX_BYTES,
+                       WAL::Durability durability = WAL::Durability::Async);
     ~LSMEngine();
 
     // Returns by value, not by reference.
@@ -28,6 +30,12 @@ public:
     void del(const std::string& key);
     std::optional<std::string> get(const std::string& key) const;
     void flush();
+
+    // Durability barrier: when this returns, every put()/del() that returned
+    // before the call is on stable storage (WAL fdatasynced, or already in an
+    // fsynced SSTable). In Durable mode every put()/del() already implies this.
+    void sync();
+    uint64_t walSyncCount() const { return wal_.syncCount(); }
 
     size_t memtableSize()  const {
         std::shared_lock<std::shared_mutex> lock(mu_);

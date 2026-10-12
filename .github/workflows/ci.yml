@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  schedule:
+    - cron: '17 3 * * 1'     # weekly mutation check
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -25,17 +28,29 @@ jobs:
     - name: Build project targets
       run: cmake --build build --config Release
 
-    - name: Run Unit Tests & Compaction Coverage
-      run: |
-        ./build/test_skip_list
-        ./build/test_bloom_filter
-        ./build/test_wal_recovery
-        ./build/test_sstable
-        ./build/test_compaction_streaming
-        ./build/test_block_cache
+    # ctest runs every test registered in CMakeLists.txt, so a new test is in CI
+    # the moment it is added; the hand-maintained list this replaced had already
+    # drifted (test_wal_ordering and test_skip_list_invariants were never run).
+    - name: Run all registered tests
+      run: ctest --test-dir build --output-on-failure --timeout 300
 
-    - name: Run Benchmarks & Regression Detection
+    # Smoke run only: proves the benchmark builds and runs. CI machines are too
+    # noisy for performance numbers to gate on; real runs are recorded in
+    # benchmarks/results.md with their hardware.
+    - name: Benchmark smoke run
+      run: ./build/bench_durability --quick --dir /tmp/lsm_ci_bench
+
+  # Plants known bugs in the engine one at a time and requires the test suite to
+  # fail for each. ~30 minutes, so weekly / on demand rather than per push.
+  mutation-check:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install dependencies
       run: |
-        ./build/bench_write
-        ./build/bench_read
-        ./build/bench_block_bottleneck
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake liburing-dev pkg-config python3
+    - name: Run mutation check
+      run: python3 tools/mutation_check.py build_mut

@@ -22,6 +22,7 @@ if(NOT APPLE)
         src/sstable/sstable_reader.cpp
         src/compaction/leveled_compactor.cpp
         src/db/lsm_engine.cpp
+        src/util/fault.cpp
     )
     target_include_directories(lsm_core PUBLIC src ${URING_INCLUDE_DIRS})
     target_link_libraries(lsm_core PUBLIC ${URING_LIBRARIES} Threads::Threads)
@@ -29,40 +30,44 @@ if(NOT APPLE)
     # Enable CTest integration
     enable_testing()
 
+    # Tests are compiled with assertions forced on. CMAKE_CXX_FLAGS_RELEASE is
+    # overridden above, but a user (or a packager) passing -DNDEBUG must not be
+    # able to turn <cassert> checks into no-ops. test_util.h's CHECK is
+    # unconditional anyway; this covers the older tests that use assert().
+    function(lsm_add_test name)
+        add_executable(${name} tests/${name}.cpp)
+        target_link_libraries(${name} PRIVATE lsm_core)
+        target_compile_options(${name} PRIVATE -UNDEBUG)
+        add_test(NAME ${name} COMMAND ${name})
+    endfunction()
+
     # Unit Tests targets
-    add_executable(test_skip_list tests/test_skip_list.cpp)
-    target_link_libraries(test_skip_list PRIVATE lsm_core)
-    add_test(NAME test_skip_list COMMAND test_skip_list)
+    lsm_add_test(test_skip_list)
 
     # Structural invariants of the lock-free SkipList under contention (issue #19).
-    add_executable(test_skip_list_invariants tests/test_skip_list_invariants.cpp)
-    target_link_libraries(test_skip_list_invariants PRIVATE lsm_core)
-    add_test(NAME test_skip_list_invariants COMMAND test_skip_list_invariants)
+    lsm_add_test(test_skip_list_invariants)
 
-    add_executable(test_bloom_filter tests/test_bloom_filter.cpp)
-    target_link_libraries(test_bloom_filter PRIVATE lsm_core)
-    add_test(NAME test_bloom_filter COMMAND test_bloom_filter)
+    lsm_add_test(test_bloom_filter)
 
-    add_executable(test_wal_recovery tests/test_wal_recovery.cpp)
-    target_link_libraries(test_wal_recovery PRIVATE lsm_core)
-    add_test(NAME test_wal_recovery COMMAND test_wal_recovery)
+    lsm_add_test(test_wal_recovery)
 
     # WAL submission-order regression tests (issue #14).
-    add_executable(test_wal_ordering tests/test_wal_ordering.cpp)
-    target_link_libraries(test_wal_ordering PRIVATE lsm_core)
-    add_test(NAME test_wal_ordering COMMAND test_wal_ordering)
+    lsm_add_test(test_wal_ordering)
 
-    add_executable(test_sstable tests/test_sstable.cpp)
-    target_link_libraries(test_sstable PRIVATE lsm_core)
-    add_test(NAME test_sstable COMMAND test_sstable)
+    lsm_add_test(test_sstable)
 
-    add_executable(test_compaction_streaming tests/test_compaction_streaming.cpp)
-    target_link_libraries(test_compaction_streaming PRIVATE lsm_core)
-    add_test(NAME test_compaction_streaming COMMAND test_compaction_streaming)
+    lsm_add_test(test_compaction_streaming)
 
-    add_executable(test_block_cache tests/test_block_cache.cpp)
-    target_link_libraries(test_block_cache PRIVATE lsm_core)
-    add_test(NAME test_block_cache COMMAND test_block_cache)
+    lsm_add_test(test_block_cache)
+
+    # Randomized model checking, crash/fault injection and the assertion canary.
+    lsm_add_test(test_randomized_model)
+    lsm_add_test(test_assertions_active)
+    lsm_add_test(test_durability_faults)
+    lsm_add_test(test_crash_recovery)
+    lsm_add_test(test_concurrent_durable)
+    lsm_add_test(test_wal_cancellation)
+    set_tests_properties(test_crash_recovery PROPERTIES TIMEOUT 300)
 
     # Benchmark targets
     add_executable(bench_write benchmarks/bench_write.cpp)
@@ -70,6 +75,9 @@ if(NOT APPLE)
 
     add_executable(bench_read benchmarks/bench_read.cpp)
     target_link_libraries(bench_read PRIVATE lsm_core)
+
+    add_executable(bench_durability benchmarks/bench_durability.cpp)
+    target_link_libraries(bench_durability PRIVATE lsm_core)
 
     add_executable(bench_block_bottleneck benchmarks/bench_block_bottleneck.cpp)
     target_link_libraries(bench_block_bottleneck PRIVATE lsm_core)
