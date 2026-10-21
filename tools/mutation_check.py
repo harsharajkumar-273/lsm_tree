@@ -66,6 +66,17 @@ MUTATIONS = [
     ("overwrite no longer replaces the value", "src/memtable/skip_list.h",
      "succs[0]->value.store(Node::makeSlot(arena_, value), std::memory_order_release);",
      ""),
+    ("scan() prefers the OLDEST version of a duplicate key", "src/db/lsm_engine.cpp",
+     "return a->rank() > b->rank();", "return a->rank() < b->rank();"),
+    ("scan() returns tombstones as empty values", "src/db/lsm_engine.cpp",
+     "if (value) out.emplace_back(std::move(key), std::move(*value));",
+     "out.emplace_back(std::move(key), value.value_or(\"\"));"),
+    ("scan() never advances shadowed sources (spins)", "src/db/lsm_engine.cpp",
+     "            stale->next();\n", ""),
+    ("scan() skips a table whose last key equals start", "src/db/lsm_engine.cpp",
+     "if (t.largestKey() < start) continue;", "if (t.largestKey() <= start) continue;"),
+    ("scan() ignores the memtable", "src/db/lsm_engine.cpp",
+     "    sources.push_back(std::make_unique<MemtableSource>(*memtable_, start, 0));\n", ""),
 ]
 
 # Mutations that cannot be observed by a user-space SIGKILL test because the page

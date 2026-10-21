@@ -31,6 +31,9 @@ public:
     std::optional<std::optional<std::string>> get(const std::string& key) const;
     std::vector<Entry> readAll() const;
     std::unique_ptr<SSTableIterator> createIterator() const;
+    // Positioned at the first entry whose key is >= start_key. The sparse
+    // index picks the block, so at most one block is read and discarded.
+    std::unique_ptr<SSTableIterator> createIterator(const std::string& start_key) const;
 
     const std::string& smallestKey() const { return smallest_key_; }
     const std::string& largestKey()  const { return largest_key_; }
@@ -68,7 +71,7 @@ private:
 
 class SSTableIterator {
 public:
-    SSTableIterator(const std::string& path, uint64_t data_end_offset);
+    SSTableIterator(const std::string& path, uint64_t data_end_offset, uint64_t start_offset = 0);
 
     bool hasNext() const { return current_.has_value(); }
     SSTable::Entry peek() const { return *current_; }

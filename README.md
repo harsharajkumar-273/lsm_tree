@@ -10,7 +10,7 @@ A C++17 log-structured merge-tree key-value engine for Linux: an `io_uring` + `O
 | | |
 |---|---|
 | **Write path** | `io_uring` + `O_DIRECT` WAL with two acknowledgment modes: `Async` (returns on submission) and `Durable` (returns after `fdatasync`, with group commit). Measured on one VM: ~100k acks/s but ~8k completed-and-synced ops/s in `Async`; 4–6k durable ops/s with 8 writers in `Durable`. See [Benchmarks](#benchmarks) |
-| **Correctness** | 14 CTest programs run in CI: randomized put/get/delete vs a reference map, SIGKILL crash recovery at 20 injected fault points, `-ECANCELED` handling when submitting threads exit, fault injection around WAL writes / flush / compaction, torn and bit-flipped logs, SkipList invariants. A mutation check plants 19 known bugs and requires the suite to catch each (one, a skipped `fdatasync`, is invisible to process-crash tests and is documented as such) |
+| **Correctness** | 15 CTest programs run in CI: randomized put/get/delete and range scans vs a reference map, SIGKILL crash recovery at 20 injected fault points, `-ECANCELED` handling when submitting threads exit, fault injection around WAL writes / flush / compaction, torn and bit-flipped logs, SkipList invariants. A mutation check plants 24 known bugs and requires the suite to catch each (one, a skipped `fdatasync`, is invisible to process-crash tests and is documented as such) |
 | **Contract** | [`DURABILITY.md`](DURABILITY.md) states exactly what a returned `put()` guarantees and which failure models are tested |
 | **Built by** | Started by [@harsharajkumar-273](https://github.com/harsharajkumar-273); developed with contributors during ELUSOC 2026 (see [Credits](#credits)) |
 
@@ -30,6 +30,8 @@ Benchmark numbers are in [`benchmarks/results.md`](benchmarks/results.md) with h
 **Flush and compaction.** When the MemTable passes its size limit (4 MiB by default) it is flushed to a sorted Level-0 SSTable and the WAL is cleared. Once there are 4 L0 tables, leveled compaction merges them into non-overlapping L1 tables with a streaming k-way merge (bounded memory) and drops tombstones.
 
 **Read path.** Lookups check the MemTable, then L0 tables newest-first, then the one L1 table whose key range matches. Before touching disk, each SSTable's Block Bloom filter is probed. The filter maps every key to a single 64-byte block, so a probe costs at most one cache-line miss and absent keys never reach disk.
+
+**Range scans.** `scan(start, end, limit)` returns live keys in `[start, end)` in order. It opens a cursor on the MemTable and on every SSTable whose key range overlaps the query, positioned with the SkipList search and the sparse index, then merges them with a min-heap ordered by key and source age. The newest version of each key wins, using the same precedence as `get()`, and tombstones hide older values. The engine's shared lock is held for the whole merge, so a scan sees one consistent state.
 
 **Recovery.** On restart the engine replays the WAL, checks each record's CRC32, skips corrupted records, and rebuilds the MemTable.
 

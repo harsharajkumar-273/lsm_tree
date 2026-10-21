@@ -270,6 +270,15 @@ public:
     };
 
     Iterator begin() const { return Iterator(list_.getHead()->next[0].load(std::memory_order_acquire)); }
+
+    // First entry whose key is >= `key`, tombstones included. Used by range
+    // scans; find() already lands succs[0] on exactly that node, hit or miss.
+    Iterator seek(const std::string& key) const {
+        Node* preds[SkipList::MAX_HEIGHT];
+        Node* succs[SkipList::MAX_HEIGHT];
+        list_.find(key, preds, succs);
+        return Iterator(succs[0]);
+    }
     Iterator end() const { return Iterator(nullptr); }
 
 private:

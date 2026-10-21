@@ -67,6 +67,12 @@ if(NOT APPLE)
     lsm_add_test(test_crash_recovery)
     lsm_add_test(test_concurrent_durable)
     lsm_add_test(test_wal_cancellation)
+
+    # Range scans merged across memtable and SSTables, against a reference map.
+    lsm_add_test(test_range_scan)
+    # A merge bug can spin forever rather than fail; bound it well below the
+    # default so the mutation check reports it quickly.
+    set_tests_properties(test_range_scan PROPERTIES TIMEOUT 120)
     set_tests_properties(test_crash_recovery PROPERTIES TIMEOUT 300)
 
     # Benchmark targets

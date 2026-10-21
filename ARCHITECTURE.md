@@ -35,6 +35,15 @@ Each SSTable file contains a data section of key-value records, followed by a sp
 - Every 64th key (configurable via `ENTRIES_PER_BLOCK`) is recorded in the sparse index along with its byte offset in the file.
 - Lookups perform a binary search on the in-memory sparse index to locate the starting offset of the target 64-entry block, narrowing down disk scans.
 
+### Range Scans
+`LSMEngine::scan(start, end, limit)` merges sorted cursors instead of issuing point lookups:
+- **Cursors**: one on the MemTable (positioned by the SkipList `find()`, which already lands on the first key `>= start`) and one per SSTable whose `[smallestKey, largestKey]` overlaps the query. An SSTable cursor uses the sparse index to seek to the block that could hold `start` and discards at most that block's leading entries.
+- **Precedence**: each cursor gets a rank equal to the order in which `get()` would consult its source: the MemTable first, then the SSTable vector from newest to oldest. A min-heap ordered by `(key, rank)` yields the newest version of a key first. Older versions of the same key are popped and advanced without being emitted, so a scan and a point read never disagree.
+- **Tombstones** win like any other version and are then dropped, so a delete in a newer layer hides a value in an older one. `limit` counts only live keys returned.
+- **Consistency**: the engine's shared lock is held for the whole merge. Writers, flushes and compactions take it exclusively, so a scan never sees a half-applied flush or a table removed mid-read. The cost is that a long scan delays writers. An iterator that outlives the lock would need pinned table versions and a frozen MemTable, which this engine does not have.
+
+Tested by `tests/test_range_scan.cpp` against a `std::map` across flushes, compactions and reopens, and by five scan mutations in `tools/mutation_check.py`.
+
 ### Cache-Aligned Block Bloom Filter
 To prevent costly disk reads for keys not in the database, each SSTable maintains an in-memory Block Bloom Filter:
 - **Cache-Line Alignment**: The filter is split into 64-byte blocks (matching CPU cache lines). Checking a key checks bits within a single 64-byte block.

@@ -226,8 +226,9 @@ std::vector<SSTable::Entry> SSTable::readAll() const {
     return entries;
 }
 
-SSTableIterator::SSTableIterator(const std::string& path, uint64_t data_end_offset)
+SSTableIterator::SSTableIterator(const std::string& path, uint64_t data_end_offset, uint64_t start_offset)
     : in_(path, std::ios::binary), data_end_offset_(data_end_offset) {
+    if (start_offset > 0) in_.seekg(static_cast<std::streamoff>(start_offset));
     advance();
 }
 
@@ -262,6 +263,12 @@ SSTable::Entry SSTableIterator::next() {
 
 std::unique_ptr<SSTableIterator> SSTable::createIterator() const {
     return std::make_unique<SSTableIterator>(path_, index_offset_);
+}
+
+std::unique_ptr<SSTableIterator> SSTable::createIterator(const std::string& start_key) const {
+    auto it = std::make_unique<SSTableIterator>(path_, index_offset_, findBlock(start_key));
+    while (it->hasNext() && it->peek().key < start_key) it->next();
+    return it;
 }
 
 uint64_t SSTable::findBlock(const std::string& key) const {
