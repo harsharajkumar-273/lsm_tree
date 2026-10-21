@@ -8,6 +8,8 @@
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <limits>
+#include <utility>
 
 class LSMEngine {
 public:
@@ -29,6 +31,20 @@ public:
     void put(const std::string& key, const std::string& value);
     void del(const std::string& key);
     std::optional<std::string> get(const std::string& key) const;
+
+    // Live key/value pairs with start <= key < end, in key order, at most
+    // `limit` of them. No `end` means no upper bound.
+    //
+    // Merges the memtable and every SSTable whose key range overlaps the
+    // query. Where several sources hold a key, the one get() would consult
+    // first wins, so a scan and a point read never disagree; tombstones hide
+    // older values and are not returned. The result is a consistent view: the
+    // shared lock is held for the whole merge, so no write lands mid-scan.
+    using KV = std::pair<std::string, std::string>;
+    std::vector<KV> scan(const std::string& start,
+                         const std::optional<std::string>& end = std::nullopt,
+                         size_t limit = std::numeric_limits<size_t>::max()) const;
+
     void flush();
 
     // Durability barrier: when this returns, every put()/del() that returned

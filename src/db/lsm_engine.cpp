@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <iostream>
+#include <queue>
 
 struct SSTFile {
     std::filesystem::path path;
@@ -124,6 +125,124 @@ std::optional<std::string> LSMEngine::get(const std::string& key) const {
         }
     }
     return std::nullopt;
+}
+
+namespace {
+
+// One sorted input to a range scan: the memtable or a single SSTable.
+//
+// `rank` orders sources by precedence, lower meaning newer. It is the position
+// get() would reach the source in — memtable first, then sstables_ from the
+// back — so the merge resolves duplicate keys exactly the way a point read
+// does, including whatever order loadSSTables() chose on reopen.
+class ScanSource {
+public:
+    explicit ScanSource(size_t rank) : rank_(rank) {}
+    virtual ~ScanSource() = default;
+
+    virtual bool valid() const = 0;
+    virtual const std::string& key() const = 0;
+    virtual const std::optional<std::string>& value() const = 0;
+    virtual void next() = 0;
+
+    size_t rank() const { return rank_; }
+
+private:
+    size_t rank_;
+};
+
+class MemtableSource final : public ScanSource {
+public:
+    MemtableSource(const Memtable& m, const std::string& start, size_t rank)
+        : ScanSource(rank), it_(m.seek(start)), end_(m.end()) {}
+
+    bool valid() const override { return it_ != end_; }
+    const std::string& key() const override { return it_->first; }
+    const std::optional<std::string>& value() const override { return it_->second; }
+    void next() override { ++it_; }
+
+private:
+    Memtable::Iterator it_;
+    Memtable::Iterator end_;
+};
+
+class SSTableSource final : public ScanSource {
+public:
+    SSTableSource(const SSTable& t, const std::string& start, size_t rank)
+        : ScanSource(rank), it_(t.createIterator(start)) { next(); }
+
+    // SSTableIterator hands entries out by value, so the current one is held
+    // here and key()/value() can return references like the memtable side.
+    bool valid() const override { return cur_.has_value(); }
+    const std::string& key() const override { return cur_->key; }
+    const std::optional<std::string>& value() const override { return cur_->value; }
+    void next() override {
+        if (it_->hasNext()) cur_ = it_->next();
+        else cur_.reset();
+    }
+
+private:
+    std::unique_ptr<SSTableIterator> it_;
+    std::optional<SSTable::Entry> cur_;
+};
+
+}  // namespace
+
+std::vector<LSMEngine::KV> LSMEngine::scan(const std::string& start,
+                                           const std::optional<std::string>& end,
+                                           size_t limit) const {
+    std::vector<KV> out;
+    if (limit == 0 || (end && *end <= start)) return out;
+
+    std::shared_lock<std::shared_mutex> lock(mu_);
+
+    std::vector<std::unique_ptr<ScanSource>> sources;
+    sources.push_back(std::make_unique<MemtableSource>(*memtable_, start, 0));
+    for (size_t i = sstables_.size(); i-- > 0;) {
+        const SSTable& t = *sstables_[i];
+        // Skip tables that cannot hold anything in range. smallestKey() and
+        // largestKey() are taken from the index, so an empty table has no
+        // meaningful bounds and is skipped outright.
+        if (t.indexSize() == 0) continue;
+        if (t.largestKey() < start) continue;
+        if (end && !(t.smallestKey() < *end)) continue;
+        sources.push_back(std::make_unique<SSTableSource>(t, start, sources.size()));
+    }
+
+    // Min-heap on (key, rank): the top is the smallest key, and among equal
+    // keys the newest source.
+    auto later = [](const ScanSource* a, const ScanSource* b) {
+        if (a->key() != b->key()) return a->key() > b->key();
+        return a->rank() > b->rank();
+    };
+    std::priority_queue<ScanSource*, std::vector<ScanSource*>, decltype(later)> heap(later);
+    for (auto& s : sources) {
+        if (s->valid()) heap.push(s.get());
+    }
+
+    while (!heap.empty() && out.size() < limit) {
+        ScanSource* winner = heap.top();
+        heap.pop();
+        if (end && !(winner->key() < *end)) break;
+
+        // Copied before any source advances: the older duplicates popped
+        // below share this key, and the winner itself moves on afterwards.
+        std::string key = winner->key();
+        std::optional<std::string> value = winner->value();
+
+        // Every older version of this key is shadowed. Advance past them.
+        while (!heap.empty() && heap.top()->key() == key) {
+            ScanSource* stale = heap.top();
+            heap.pop();
+            stale->next();
+            if (stale->valid()) heap.push(stale);
+        }
+        winner->next();
+        if (winner->valid()) heap.push(winner);
+
+        if (value) out.emplace_back(std::move(key), std::move(*value));
+    }
+    return out;
 }
 
 void LSMEngine::flush() {
