@@ -12,6 +12,7 @@ void printHelp() {
     std::cout << "  put <key> <value>   - Insert or update a key-value pair\n";
     std::cout << "  get <key>           - Query value for a key\n";
     std::cout << "  del <key>           - Delete key (writes a tombstone)\n";
+    std::cout << "  scan <start> [end]  - List live keys in [start, end), up to 100\n";
     std::cout << "  flush               - Manually flush MemTable to SSTable on disk\n";
     std::cout << "  stats               - Show current RAM MemTable & Disk SSTable stats\n";
     std::cout << "  help                - Display this help message\n";
@@ -78,6 +79,20 @@ int main(int argc, char* argv[]) {
             }
             db.del(key);
             std::cout << "  \033[33m[DELETED]\033[0m Key '" << key << "' marked for deletion\n";
+        } else if (cmd == "scan") {
+            std::string start, end;
+            ss >> start >> end;
+            if (start.empty()) {
+                std::cout << "Usage: scan <start> [end]\n";
+                continue;
+            }
+            constexpr size_t kMaxRows = 100;
+            auto rows = db.scan(start, end.empty() ? std::nullopt : std::optional<std::string>(end), kMaxRows);
+            for (const auto& [k, v] : rows) {
+                std::cout << "  " << k << " => '" << v << "'\n";
+            }
+            std::cout << "  \033[32m[" << rows.size() << " KEYS]\033[0m"
+                      << (rows.size() == kMaxRows ? " (limit reached)" : "") << "\n";
         } else if (cmd == "flush") {
             db.flush();
             std::cout << "  \033[32m[FLUSHED]\033[0m Active MemTable written out to SSTable on disk!\n";
